@@ -34,6 +34,7 @@ class MainWindow(ctk.CTk):
         self._roi_sliders: list[ctk.CTkSlider] = []
         self._auto_roi_last_frame_index: int | None = None
         self._auto_roi_smoothed: DangerZonePct | None = None
+        self._auto_roi_every_n_frames_var = tk.IntVar(value=5)
 
         self._build_ui()
         self._tick()
@@ -98,7 +99,9 @@ class MainWindow(ctk.CTk):
         # Throttle updates to avoid visible jitter
         if not force:
             last_idx = self._auto_roi_last_frame_index
-            if last_idx is not None and (fr.frame_info.frame_index - last_idx) < 15:
+            every_n = int(self._auto_roi_every_n_frames_var.get() or 1)
+            every_n = max(1, min(60, every_n))
+            if last_idx is not None and (fr.frame_info.frame_index - last_idx) < every_n:
                 return
 
         est = estimate_danger_zone_pct(fr.frame_bgr)
@@ -108,16 +111,14 @@ class MainWindow(ctk.CTk):
         if prev is None:
             sm = est
         else:
-            sm = DangerZonePct(
-                x1=(1 - alpha) * prev.x1 + alpha * est.x1,
-                y1=(1 - alpha) * prev.y1 + alpha * est.y1,
-                x2=(1 - alpha) * prev.x2 + alpha * est.x2,
-                y2=(1 - alpha) * prev.y2 + alpha * est.y2,
-                x3=(1 - alpha) * prev.x3 + alpha * est.x3,
-                y3=(1 - alpha) * prev.y3 + alpha * est.y3,
-                x4=(1 - alpha) * prev.x4 + alpha * est.x4,
-                y4=(1 - alpha) * prev.y4 + alpha * est.y4,
-            ).clamp()
+            # point-wise smoothing (requires stable number/order of points)
+            n = min(len(prev.points), len(est.points))
+            pts: list[tuple[float, float]] = []
+            for i in range(n):
+                px, py = prev.points[i]
+                ex, ey = est.points[i]
+                pts.append(((1 - alpha) * px + alpha * ex, (1 - alpha) * py + alpha * ey))
+            sm = DangerZonePct(points=pts).clamp()
 
         self._auto_roi_smoothed = sm
         self._auto_roi_last_frame_index = fr.frame_info.frame_index
@@ -157,15 +158,15 @@ class MainWindow(ctk.CTk):
         else:
             roi_pct = self._get_roi_pct_clamped()
             # rectangle -> quad
-            dz = DangerZonePct(
-                x1=roi_pct.x,
-                y1=roi_pct.y,
-                x2=roi_pct.x + roi_pct.w,
-                y2=roi_pct.y,
-                x3=roi_pct.x + roi_pct.w,
-                y3=roi_pct.y + roi_pct.h,
-                x4=roi_pct.x,
-                y4=roi_pct.y + roi_pct.h,
+            dz = DangerZonePct.from_quad(
+                roi_pct.x,
+                roi_pct.y,
+                roi_pct.x + roi_pct.w,
+                roi_pct.y,
+                roi_pct.x + roi_pct.w,
+                roi_pct.y + roi_pct.h,
+                roi_pct.x,
+                roi_pct.y + roi_pct.h,
             ).clamp()
             dz_px = danger_zone_pct_to_px(dz, w, h)
 
@@ -219,20 +220,19 @@ class MainWindow(ctk.CTk):
             # show ROI overlay even before старт
             h, w = frame.shape[:2]
             roi = self._get_roi_pct_clamped()
-            dz = DangerZonePct(
-                x1=roi.x,
-                y1=roi.y,
-                x2=roi.x + roi.w,
-                y2=roi.y,
-                x3=roi.x + roi.w,
-                y3=roi.y + roi.h,
-                x4=roi.x,
-                y4=roi.y + roi.h,
+            dz = DangerZonePct.from_quad(
+                roi.x,
+                roi.y,
+                roi.x + roi.w,
+                roi.y,
+                roi.x + roi.w,
+                roi.y + roi.h,
+                roi.x,
+                roi.y + roi.h,
             ).clamp()
             dz_px = danger_zone_pct_to_px(dz, w, h)
             tmp = frame.copy()
-            pts = [(dz_px.x1, dz_px.y1), (dz_px.x2, dz_px.y2), (dz_px.x3, dz_px.y3), (dz_px.x4, dz_px.y4)]
-            cv2.polylines(tmp, [np.array(pts, dtype=np.int32)], isClosed=True, color=(255, 200, 0), thickness=2)
+            cv2.polylines(tmp, [np.array(dz_px.as_int32_polyline, dtype=np.int32)], isClosed=True, color=(255, 200, 0), thickness=2)
             self._set_preview_bgr(tmp)
         finally:
             cap.release()
@@ -329,7 +329,7 @@ class MainWindow(ctk.CTk):
         self.roi_auto_var = tk.BooleanVar(value=False)
         self.chk_auto_roi = ctk.CTkCheckBox(
             frm_roi,
-            text="Авто ROI (danger_zone)",
+            text="Авто danger_zone (по границам дороги)",
             variable=self.roi_auto_var,
             command=self._on_auto_roi_toggle,
         )
@@ -337,6 +337,21 @@ class MainWindow(ctk.CTk):
 
         self.btn_roi_recalc = ctk.CTkButton(frm_roi, text="Пересчитать по кадру", command=lambda: self._auto_roi_recompute(force=True))
         self.btn_roi_recalc.grid(row=9, column=1, sticky="e", padx=(0, 10), pady=(0, 6))
+
+        # Auto-ROI frequency (frames)
+        ctk.CTkLabel(frm_roi, text="Авто-обновление (кадров):", anchor="w", text_color="#bbb").grid(
+            row=10, column=0, sticky="w", padx=10, pady=(0, 0)
+        )
+        self._auto_roi_every_n_lbl = ctk.CTkLabel(frm_roi, text="5", anchor="e", text_color="#bbb")
+        self._auto_roi_every_n_lbl.grid(row=10, column=1, sticky="e", padx=(0, 10), pady=(0, 0))
+        self._auto_roi_every_n_slider = ctk.CTkSlider(
+            frm_roi,
+            from_=1,
+            to=30,
+            variable=self._auto_roi_every_n_frames_var,
+            number_of_steps=29,
+        )
+        self._auto_roi_every_n_slider.grid(row=11, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
 
         # Export
         frm_exp = ctk.CTkFrame(left)
@@ -393,6 +408,7 @@ class MainWindow(ctk.CTk):
         # Bind updates for labels
         self.conf_var.trace_add("write", lambda *_: self.conf_lbl.configure(text=f"{self.conf_var.get():.2f}"))
         self.min_area_var.trace_add("write", lambda *_: self.min_area_lbl.configure(text=f"{self.min_area_var.get():.2f}%"))
+        self._auto_roi_every_n_frames_var.trace_add("write", lambda *_: self._auto_roi_every_n_lbl.configure(text=str(int(self._auto_roi_every_n_frames_var.get() or 1))))
         # ROI realtime (values + apply)
         self.roi_x.trace_add("write", lambda *_: self._on_roi_change())
         self.roi_y.trace_add("write", lambda *_: self._on_roi_change())

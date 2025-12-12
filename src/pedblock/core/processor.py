@@ -105,17 +105,12 @@ class VideoProcessor:
         self._enqueue_ctrl(_ControlCmd(kind="roi", value=(roi.x, roi.y, roi.w, roi.h)))
 
     def set_danger_zone_pct(self, dz: DangerZonePct) -> None:
-        dz = DangerZonePct(
-            x1=float(dz.x1),
-            y1=float(dz.y1),
-            x2=float(dz.x2),
-            y2=float(dz.y2),
-            x3=float(dz.x3),
-            y3=float(dz.y3),
-            x4=float(dz.x4),
-            y4=float(dz.y4),
-        ).clamp()
-        self._enqueue_ctrl(_ControlCmd(kind="danger_zone", value=(dz.x1, dz.y1, dz.x2, dz.y2, dz.x3, dz.y3, dz.x4, dz.y4)))
+        dz = DangerZonePct(points=[(float(x), float(y)) for (x, y) in dz.points]).clamp()
+        flat: list[float] = []
+        for x, y in dz.points:
+            flat.append(float(x))
+            flat.append(float(y))
+        self._enqueue_ctrl(_ControlCmd(kind="danger_zone", value=tuple(flat)))
 
     def poll(self, max_items: int = 5) -> list[FrameResult | ProcessorProgress | Exception]:
         items: list[FrameResult | ProcessorProgress | Exception] = []
@@ -175,32 +170,26 @@ class VideoProcessor:
                     x, y, w, h = cmd.value  # type: ignore[misc]
                     self._roi_pct = RoiPct(x=float(x), y=float(y), w=float(w), h=float(h)).clamp()
                     # If user sets a rectangle ROI manually, treat it as a quad (rectangle).
-                    self._danger_zone_pct = DangerZonePct(
-                        x1=self._roi_pct.x,
-                        y1=self._roi_pct.y,
-                        x2=self._roi_pct.x + self._roi_pct.w,
-                        y2=self._roi_pct.y,
-                        x3=self._roi_pct.x + self._roi_pct.w,
-                        y3=self._roi_pct.y + self._roi_pct.h,
-                        x4=self._roi_pct.x,
-                        y4=self._roi_pct.y + self._roi_pct.h,
+                    self._danger_zone_pct = DangerZonePct.from_quad(
+                        self._roi_pct.x,
+                        self._roi_pct.y,
+                        self._roi_pct.x + self._roi_pct.w,
+                        self._roi_pct.y,
+                        self._roi_pct.x + self._roi_pct.w,
+                        self._roi_pct.y + self._roi_pct.h,
+                        self._roi_pct.x,
+                        self._roi_pct.y + self._roi_pct.h,
                     ).clamp()
                 except Exception:
                     # ignore malformed roi commands
                     pass
             elif cmd.kind == "danger_zone":
                 try:
-                    x1, y1, x2, y2, x3, y3, x4, y4 = cmd.value  # type: ignore[misc]
-                    self._danger_zone_pct = DangerZonePct(
-                        x1=float(x1),
-                        y1=float(y1),
-                        x2=float(x2),
-                        y2=float(y2),
-                        x3=float(x3),
-                        y3=float(y3),
-                        x4=float(x4),
-                        y4=float(y4),
-                    ).clamp()
+                    flat = list(cmd.value)  # type: ignore[arg-type]
+                    pts: list[tuple[float, float]] = []
+                    for i in range(0, len(flat) - 1, 2):
+                        pts.append((float(flat[i]), float(flat[i + 1])))
+                    self._danger_zone_pct = DangerZonePct(points=pts).clamp()
                 except Exception:
                     pass
 
@@ -252,15 +241,15 @@ class VideoProcessor:
             w=float(det_cfg.roi.w),
             h=float(det_cfg.roi.h),
         ).clamp()
-        self._danger_zone_pct = DangerZonePct(
-            x1=self._roi_pct.x,
-            y1=self._roi_pct.y,
-            x2=self._roi_pct.x + self._roi_pct.w,
-            y2=self._roi_pct.y,
-            x3=self._roi_pct.x + self._roi_pct.w,
-            y3=self._roi_pct.y + self._roi_pct.h,
-            x4=self._roi_pct.x,
-            y4=self._roi_pct.y + self._roi_pct.h,
+        self._danger_zone_pct = DangerZonePct.from_quad(
+            self._roi_pct.x,
+            self._roi_pct.y,
+            self._roi_pct.x + self._roi_pct.w,
+            self._roi_pct.y,
+            self._roi_pct.x + self._roi_pct.w,
+            self._roi_pct.y + self._roi_pct.h,
+            self._roi_pct.x,
+            self._roi_pct.y + self._roi_pct.h,
         ).clamp()
 
         try:
@@ -280,15 +269,15 @@ class VideoProcessor:
                 dz_pct = self._danger_zone_pct
                 if dz_pct is None:
                     roi = roi_pct_to_px(self._roi_pct.x, self._roi_pct.y, self._roi_pct.w, self._roi_pct.h, w, h)
-                    dz_pct = DangerZonePct(
-                        x1=self._roi_pct.x,
-                        y1=self._roi_pct.y,
-                        x2=self._roi_pct.x + self._roi_pct.w,
-                        y2=self._roi_pct.y,
-                        x3=self._roi_pct.x + self._roi_pct.w,
-                        y3=self._roi_pct.y + self._roi_pct.h,
-                        x4=self._roi_pct.x,
-                        y4=self._roi_pct.y + self._roi_pct.h,
+                    dz_pct = DangerZonePct.from_quad(
+                        self._roi_pct.x,
+                        self._roi_pct.y,
+                        self._roi_pct.x + self._roi_pct.w,
+                        self._roi_pct.y,
+                        self._roi_pct.x + self._roi_pct.w,
+                        self._roi_pct.y + self._roi_pct.h,
+                        self._roi_pct.x,
+                        self._roi_pct.y + self._roi_pct.h,
                     ).clamp()
                 dz = danger_zone_pct_to_px(dz_pct, w, h)
 
@@ -353,14 +342,7 @@ class VideoProcessor:
                         None
                         if self._danger_zone_pct is None
                         else {
-                            "x1": self._danger_zone_pct.x1,
-                            "y1": self._danger_zone_pct.y1,
-                            "x2": self._danger_zone_pct.x2,
-                            "y2": self._danger_zone_pct.y2,
-                            "x3": self._danger_zone_pct.x3,
-                            "y3": self._danger_zone_pct.y3,
-                            "x4": self._danger_zone_pct.x4,
-                            "y4": self._danger_zone_pct.y4,
+                            "points": [{"x": float(x), "y": float(y)} for (x, y) in self._danger_zone_pct.points],
                         }
                     ),
                     "min_area_pct": det_cfg.min_area_pct,

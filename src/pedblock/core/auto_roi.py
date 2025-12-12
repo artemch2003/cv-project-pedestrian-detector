@@ -14,6 +14,7 @@ class AutoRoiParams:
 
     # Only analyze the bottom part of the frame (where the road is usually visible)
     analyze_top_frac: float = 0.40  # 0..1 (0.40 => ignore top 40%)
+    analyze_x_margin_frac: float = 0.06  # 0..0.45 crop left/right margins to reduce irrelevant edges
 
     # Horizon for danger-zone top (where the projected zone begins)
     roi_top_frac: float = 0.60  # 0..1 (0.60 => zone starts at 60% of height)
@@ -40,6 +41,8 @@ class AutoRoiParams:
     fallback_top_w: float = 40.0
     fallback_bottom_w: float = 80.0
     fallback_center_x: float = 50.0
+    # Prefer lane/edge markings (best-effort). Helps on dashcam footage with visible marking.
+    use_lane_color_mask: bool = True
 
 
 def estimate_danger_zone_pct(frame_bgr: np.ndarray, params: AutoRoiParams | None = None) -> DangerZonePct:
@@ -69,6 +72,30 @@ def estimate_danger_zone_pct(frame_bgr: np.ndarray, params: AutoRoiParams | None
     y_cut = int(round(h * p.analyze_top_frac))
     if 0 < y_cut < h:
         edges[:y_cut, :] = 0
+    # Also crop left/right margins to avoid sidewalks/skyline clutter
+    xm = int(round(float(w) * float(max(0.0, min(0.45, p.analyze_x_margin_frac)))))
+    if xm > 0 and xm * 2 < w:
+        edges[:, :xm] = 0
+        edges[:, w - xm :] = 0
+
+    # Optional: emphasize typical lane/edge markings (white/yellow) in the analyzed region.
+    # This is a heuristic, but it usually stabilizes the corridor on dashcam footage.
+    if p.use_lane_color_mask:
+        hls = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HLS)
+        H, L, S = cv2.split(hls)
+        # White-ish (high L, low S)
+        white = cv2.inRange(L, 190, 255) & cv2.inRange(S, 0, 90)
+        # Yellow-ish (H in ~[12..45], reasonably saturated and bright)
+        yellow = cv2.inRange(H, 12, 45) & cv2.inRange(S, 70, 255) & cv2.inRange(L, 80, 255)
+        mask = cv2.bitwise_or(white, yellow)
+        if 0 < y_cut < h:
+            mask[:y_cut, :] = 0
+        if xm > 0 and xm * 2 < w:
+            mask[:, :xm] = 0
+            mask[:, w - xm :] = 0
+        # Keep some non-marking edges too: OR with a slightly dilated mask to avoid gaps.
+        mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+        edges = cv2.bitwise_and(edges, mask)
 
     min_line_len = max(10, int(round(w * p.min_line_len_frac)))
     lines = cv2.HoughLinesP(
@@ -140,13 +167,22 @@ def estimate_danger_zone_pct(frame_bgr: np.ndarray, params: AutoRoiParams | None
     if not np.isfinite([xL_b, xL_t, xR_b, xR_t]).all():
         return _fallback_trapezoid(p)
 
-    x_left = float(min(xL_b, xL_t))
-    x_right = float(max(xR_b, xR_t))
-    if x_right < x_left:
-        x_left, x_right = x_right, x_left
+    # Ensure a consistent left/right ordering at both horizons.
+    xL_t, xR_t = (float(xL_t), float(xR_t))
+    xL_b, xR_b = (float(xL_b), float(xR_b))
+    if xL_t > xR_t:
+        xL_t, xR_t = xR_t, xL_t
+    if xL_b > xR_b:
+        xL_b, xR_b = xR_b, xL_b
+
+    # Quick sanity: corridor must not collapse
+    if (xR_t - xL_t) < 5.0 or (xR_b - xL_b) < 5.0:
+        return _fallback_trapezoid(p)
 
     # Expand and clamp
     x_pad = float(w) * float(p.x_pad_frac)
+    x_left = min(xL_t, xL_b)
+    x_right = max(xR_t, xR_b)
     x1 = int(round(x_left - x_pad))
     x2 = int(round(x_right + x_pad))
     x1 = max(0, min(w - 2, x1))
@@ -164,11 +200,11 @@ def estimate_danger_zone_pct(frame_bgr: np.ndarray, params: AutoRoiParams | None
     if y2 <= y1:
         return _fallback_trapezoid(p)
 
-    # Convert to trapezoid percents using left/right at y_top and y_bottom
-    x1_t = float(min(xL_t, xR_t)) - x_pad
-    x2_t = float(max(xL_t, xR_t)) + x_pad
-    x1_b = float(min(xL_b, xR_b)) - x_pad
-    x2_b = float(max(xL_b, xR_b)) + x_pad
+    # Convert to trapezoid percents using *left/right* at y_top and y_bottom.
+    x1_t = float(xL_t) - x_pad
+    x2_t = float(xR_t) + x_pad
+    x1_b = float(xL_b) - x_pad
+    x2_b = float(xR_b) + x_pad
 
     def clamp_x(v: float) -> float:
         return float(max(0.0, min(float(w - 1), v)))
@@ -178,14 +214,12 @@ def estimate_danger_zone_pct(frame_bgr: np.ndarray, params: AutoRoiParams | None
         return _fallback_trapezoid(p)
 
     dz = DangerZonePct(
-        x1=(x1_t / float(w)) * 100.0,
-        y1=(float(y1) / float(h)) * 100.0,
-        x2=(x2_t / float(w)) * 100.0,
-        y2=(float(y1) / float(h)) * 100.0,
-        x3=(x2_b / float(w)) * 100.0,
-        y3=(float(y2) / float(h)) * 100.0,
-        x4=(x1_b / float(w)) * 100.0,
-        y4=(float(y2) / float(h)) * 100.0,
+        points=[
+            ((x1_t / float(w)) * 100.0, (float(y1) / float(h)) * 100.0),
+            ((x2_t / float(w)) * 100.0, (float(y1) / float(h)) * 100.0),
+            ((x2_b / float(w)) * 100.0, (float(y2) / float(h)) * 100.0),
+            ((x1_b / float(w)) * 100.0, (float(y2) / float(h)) * 100.0),
+        ]
     ).clamp()
     return dz
 
@@ -201,6 +235,6 @@ def _fallback_trapezoid(p: AutoRoiParams) -> DangerZonePct:
     x2 = cx + top_w / 2.0
     x4 = cx - bot_w / 2.0
     x3 = cx + bot_w / 2.0
-    return DangerZonePct(x1=x1, y1=top_y, x2=x2, y2=top_y, x3=x3, y3=bot_y, x4=x4, y4=bot_y).clamp()
+    return DangerZonePct(points=[(x1, top_y), (x2, top_y), (x3, bot_y), (x4, bot_y)]).clamp()
 
 

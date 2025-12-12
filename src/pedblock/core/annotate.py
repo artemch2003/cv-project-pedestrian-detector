@@ -18,8 +18,7 @@ def draw_annotations(
     out = bgr.copy()
 
     # ROI
-    pts = [(roi.x1, roi.y1), (roi.x2, roi.y2), (roi.x3, roi.y3), (roi.x4, roi.y4)]
-    cv2.polylines(out, [np.array(pts, dtype=np.int32)], isClosed=True, color=(255, 200, 0), thickness=2)
+    cv2.polylines(out, [np.array(roi.as_int32_polyline, dtype=np.int32)], isClosed=True, color=(255, 200, 0), thickness=2)
 
     # Boxes
     for b in boxes:
