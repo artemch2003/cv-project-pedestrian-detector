@@ -5,20 +5,21 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from pedblock.core.roi import RoiPx
+from pedblock.core.danger_zone import DangerZonePx
 from pedblock.core.types import Box
 
 
 def draw_annotations(
     bgr: np.ndarray,
-    roi: RoiPx,
+    roi: DangerZonePx,
     boxes: Iterable[Box],
     obstructing: bool,
 ) -> np.ndarray:
     out = bgr.copy()
 
     # ROI
-    cv2.rectangle(out, (roi.x1, roi.y1), (roi.x2, roi.y2), (255, 200, 0), 2)
+    pts = [(roi.x1, roi.y1), (roi.x2, roi.y2), (roi.x3, roi.y3), (roi.x4, roi.y4)]
+    cv2.polylines(out, [np.array(pts, dtype=np.int32)], isClosed=True, color=(255, 200, 0), thickness=2)
 
     # Boxes
     for b in boxes:

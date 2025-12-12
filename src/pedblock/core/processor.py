@@ -13,6 +13,7 @@ import numpy as np
 
 from pedblock.core.annotate import draw_annotations
 from pedblock.core.config import DetectionConfig, ExportConfig, RoiPct
+from pedblock.core.danger_zone import DangerZonePct, danger_zone_pct_to_px
 from pedblock.core.events import EventRecorder, ObstructionSpan, spans_to_jsonable
 from pedblock.core.roi import roi_pct_to_px
 from pedblock.core.types import Box, FrameInfo
@@ -61,6 +62,7 @@ class VideoProcessor:
         self._realtime = True
         self._speed = 1.0
         self._roi_pct = RoiPct()
+        self._danger_zone_pct: DangerZonePct | None = None
 
     def start(self, video_path: str, det_cfg: DetectionConfig, exp_cfg: ExportConfig) -> None:
         with self._running_lock:
@@ -101,6 +103,19 @@ class VideoProcessor:
         # send as a tuple to keep control channel simple/pickle-free
         roi = RoiPct(x=float(roi.x), y=float(roi.y), w=float(roi.w), h=float(roi.h)).clamp()
         self._enqueue_ctrl(_ControlCmd(kind="roi", value=(roi.x, roi.y, roi.w, roi.h)))
+
+    def set_danger_zone_pct(self, dz: DangerZonePct) -> None:
+        dz = DangerZonePct(
+            x1=float(dz.x1),
+            y1=float(dz.y1),
+            x2=float(dz.x2),
+            y2=float(dz.y2),
+            x3=float(dz.x3),
+            y3=float(dz.y3),
+            x4=float(dz.x4),
+            y4=float(dz.y4),
+        ).clamp()
+        self._enqueue_ctrl(_ControlCmd(kind="danger_zone", value=(dz.x1, dz.y1, dz.x2, dz.y2, dz.x3, dz.y3, dz.x4, dz.y4)))
 
     def poll(self, max_items: int = 5) -> list[FrameResult | ProcessorProgress | Exception]:
         items: list[FrameResult | ProcessorProgress | Exception] = []
@@ -159,8 +174,34 @@ class VideoProcessor:
                 try:
                     x, y, w, h = cmd.value  # type: ignore[misc]
                     self._roi_pct = RoiPct(x=float(x), y=float(y), w=float(w), h=float(h)).clamp()
+                    # If user sets a rectangle ROI manually, treat it as a quad (rectangle).
+                    self._danger_zone_pct = DangerZonePct(
+                        x1=self._roi_pct.x,
+                        y1=self._roi_pct.y,
+                        x2=self._roi_pct.x + self._roi_pct.w,
+                        y2=self._roi_pct.y,
+                        x3=self._roi_pct.x + self._roi_pct.w,
+                        y3=self._roi_pct.y + self._roi_pct.h,
+                        x4=self._roi_pct.x,
+                        y4=self._roi_pct.y + self._roi_pct.h,
+                    ).clamp()
                 except Exception:
                     # ignore malformed roi commands
+                    pass
+            elif cmd.kind == "danger_zone":
+                try:
+                    x1, y1, x2, y2, x3, y3, x4, y4 = cmd.value  # type: ignore[misc]
+                    self._danger_zone_pct = DangerZonePct(
+                        x1=float(x1),
+                        y1=float(y1),
+                        x2=float(x2),
+                        y2=float(y2),
+                        x3=float(x3),
+                        y3=float(y3),
+                        x4=float(x4),
+                        y4=float(y4),
+                    ).clamp()
+                except Exception:
                     pass
 
     def _run(self, video_path: str, det_cfg: DetectionConfig, exp_cfg: ExportConfig) -> None:
@@ -211,6 +252,16 @@ class VideoProcessor:
             w=float(det_cfg.roi.w),
             h=float(det_cfg.roi.h),
         ).clamp()
+        self._danger_zone_pct = DangerZonePct(
+            x1=self._roi_pct.x,
+            y1=self._roi_pct.y,
+            x2=self._roi_pct.x + self._roi_pct.w,
+            y2=self._roi_pct.y,
+            x3=self._roi_pct.x + self._roi_pct.w,
+            y3=self._roi_pct.y + self._roi_pct.h,
+            x4=self._roi_pct.x,
+            y4=self._roi_pct.y + self._roi_pct.h,
+        ).clamp()
 
         try:
             while not self._stop_event.is_set():
@@ -226,7 +277,20 @@ class VideoProcessor:
                 frame_index += 1
 
                 h, w = frame.shape[:2]
-                roi = roi_pct_to_px(self._roi_pct.x, self._roi_pct.y, self._roi_pct.w, self._roi_pct.h, w, h)
+                dz_pct = self._danger_zone_pct
+                if dz_pct is None:
+                    roi = roi_pct_to_px(self._roi_pct.x, self._roi_pct.y, self._roi_pct.w, self._roi_pct.h, w, h)
+                    dz_pct = DangerZonePct(
+                        x1=self._roi_pct.x,
+                        y1=self._roi_pct.y,
+                        x2=self._roi_pct.x + self._roi_pct.w,
+                        y2=self._roi_pct.y,
+                        x3=self._roi_pct.x + self._roi_pct.w,
+                        y3=self._roi_pct.y + self._roi_pct.h,
+                        x4=self._roi_pct.x,
+                        y4=self._roi_pct.y + self._roi_pct.h,
+                    ).clamp()
+                dz = danger_zone_pct_to_px(dz_pct, w, h)
 
                 persons = [b.clamp(w, h) for b in det.detect_persons(frame)]
                 frame_area = float(w * h) if w > 0 and h > 0 else 1.0
@@ -236,13 +300,13 @@ class VideoProcessor:
                 for b in persons:
                     if b.area < min_area:
                         continue
-                    if roi.contains_point(b.cx, b.cy):
+                    if dz.contains_point(b.cx, b.cy):
                         obstructing = True
                         break
 
                 spans.extend(recorder.update(frame_index, obstructing))
 
-                annotated = draw_annotations(frame, roi, persons, obstructing)
+                annotated = draw_annotations(frame, dz, persons, obstructing)
                 if writer is not None:
                     writer.write(annotated)
 
@@ -285,6 +349,20 @@ class VideoProcessor:
                     "video_path": video_path,
                     "generated_at": datetime.now().isoformat(timespec="seconds"),
                     "roi_pct": {"x": self._roi_pct.x, "y": self._roi_pct.y, "w": self._roi_pct.w, "h": self._roi_pct.h},
+                    "danger_zone_pct": (
+                        None
+                        if self._danger_zone_pct is None
+                        else {
+                            "x1": self._danger_zone_pct.x1,
+                            "y1": self._danger_zone_pct.y1,
+                            "x2": self._danger_zone_pct.x2,
+                            "y2": self._danger_zone_pct.y2,
+                            "x3": self._danger_zone_pct.x3,
+                            "y3": self._danger_zone_pct.y3,
+                            "x4": self._danger_zone_pct.x4,
+                            "y4": self._danger_zone_pct.y4,
+                        }
+                    ),
                     "min_area_pct": det_cfg.min_area_pct,
                     "model_name": det_cfg.model_name,
                     "device": det_cfg.device,

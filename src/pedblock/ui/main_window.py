@@ -6,11 +6,13 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
 
 from pedblock import __version__ as app_version
 from pedblock.core.config import DetectionConfig, ExportConfig, RoiPct
-from pedblock.core.roi import roi_pct_to_px
+from pedblock.core.auto_roi import estimate_danger_zone_pct
+from pedblock.core.danger_zone import DangerZonePct, danger_zone_pct_to_px
 from pedblock.core.processor import FrameResult, ProcessorProgress, VideoProcessor
 from pedblock.core.annotate import draw_annotations
 
@@ -29,6 +31,9 @@ class MainWindow(ctk.CTk):
         self._roi_internal_update = False
         self._last_frame: FrameResult | None = None
         self._roi_value_labels: dict[str, ctk.CTkLabel] = {}
+        self._roi_sliders: list[ctk.CTkSlider] = []
+        self._auto_roi_last_frame_index: int | None = None
+        self._auto_roi_smoothed: DangerZonePct | None = None
 
         self._build_ui()
         self._tick()
@@ -65,6 +70,71 @@ class MainWindow(ctk.CTk):
         finally:
             self._roi_internal_update = False
 
+    def _set_roi_controls_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for s in self._roi_sliders:
+            try:
+                s.configure(state=state)
+            except Exception:
+                # ignore if a widget doesn't support state (older CTk versions)
+                pass
+
+    def _apply_roi_pct(self, roi: RoiPct) -> None:
+        # manual ROI sliders define a rectangle; keep them, but convert later for processing/drawing
+        roi = roi.clamp()
+        self._apply_roi_to_vars(roi)
+        self._update_roi_value_labels()
+        if self._processor.is_running():
+            self._processor.set_roi_pct(roi)
+        self._render_preview_from_last()
+
+    def _auto_roi_recompute(self, *, force: bool = False) -> None:
+        if not bool(self.roi_auto_var.get()):
+            return
+        fr = self._last_frame
+        if fr is None:
+            return
+
+        # Throttle updates to avoid visible jitter
+        if not force:
+            last_idx = self._auto_roi_last_frame_index
+            if last_idx is not None and (fr.frame_info.frame_index - last_idx) < 15:
+                return
+
+        est = estimate_danger_zone_pct(fr.frame_bgr)
+        # Smooth to avoid flicker on noisy lines
+        alpha = 0.30
+        prev = self._auto_roi_smoothed
+        if prev is None:
+            sm = est
+        else:
+            sm = DangerZonePct(
+                x1=(1 - alpha) * prev.x1 + alpha * est.x1,
+                y1=(1 - alpha) * prev.y1 + alpha * est.y1,
+                x2=(1 - alpha) * prev.x2 + alpha * est.x2,
+                y2=(1 - alpha) * prev.y2 + alpha * est.y2,
+                x3=(1 - alpha) * prev.x3 + alpha * est.x3,
+                y3=(1 - alpha) * prev.y3 + alpha * est.y3,
+                x4=(1 - alpha) * prev.x4 + alpha * est.x4,
+                y4=(1 - alpha) * prev.y4 + alpha * est.y4,
+            ).clamp()
+
+        self._auto_roi_smoothed = sm
+        self._auto_roi_last_frame_index = fr.frame_info.frame_index
+        # apply to processor as a rectangle fallback (old API), but render/preview uses quad
+        if self._processor.is_running():
+            self._processor.set_danger_zone_pct(sm)
+        self._render_preview_from_last()
+
+    def _on_auto_roi_toggle(self) -> None:
+        enabled = bool(self.roi_auto_var.get())
+        self._set_roi_controls_enabled(not enabled)
+        if enabled:
+            # reset smoothing to quickly lock onto the scene
+            self._auto_roi_smoothed = None
+            self._auto_roi_last_frame_index = None
+            self._auto_roi_recompute(force=True)
+
     def _update_roi_value_labels(self) -> None:
         # show as percents with 0 decimals (sliders are integer-stepped)
         if "X" in self._roi_value_labels:
@@ -80,10 +150,24 @@ class MainWindow(ctk.CTk):
         fr = self._last_frame
         if fr is None:
             return
-        roi_pct = self._get_roi_pct_clamped()
         w = int(fr.frame_info.width)
         h = int(fr.frame_info.height)
-        roi_px = roi_pct_to_px(roi_pct.x, roi_pct.y, roi_pct.w, roi_pct.h, w, h)
+        if bool(getattr(self, "roi_auto_var", tk.BooleanVar(value=False)).get()) and self._auto_roi_smoothed is not None:
+            dz_px = danger_zone_pct_to_px(self._auto_roi_smoothed, w, h)
+        else:
+            roi_pct = self._get_roi_pct_clamped()
+            # rectangle -> quad
+            dz = DangerZonePct(
+                x1=roi_pct.x,
+                y1=roi_pct.y,
+                x2=roi_pct.x + roi_pct.w,
+                y2=roi_pct.y,
+                x3=roi_pct.x + roi_pct.w,
+                y3=roi_pct.y + roi_pct.h,
+                x4=roi_pct.x,
+                y4=roi_pct.y + roi_pct.h,
+            ).clamp()
+            dz_px = danger_zone_pct_to_px(dz, w, h)
 
         # recompute obstructing for the preview (so pause + ROI move feels instant)
         frame_area = float(w * h) if w > 0 and h > 0 else 1.0
@@ -92,15 +176,18 @@ class MainWindow(ctk.CTk):
         for b in fr.persons:
             if b.area < min_area:
                 continue
-            if roi_px.contains_point(b.cx, b.cy):
+            if dz_px.contains_point(b.cx, b.cy):
                 obstructing = True
                 break
 
-        annotated = draw_annotations(fr.frame_bgr, roi_px, fr.persons, obstructing)
+        annotated = draw_annotations(fr.frame_bgr, dz_px, fr.persons, obstructing)
         self._set_preview_bgr(annotated)
 
     def _on_roi_change(self) -> None:
         if self._roi_internal_update:
+            return
+        # ignore manual changes when auto-mode is enabled (sliders are disabled, but keep it safe)
+        if bool(getattr(self, "roi_auto_var", tk.BooleanVar(value=False)).get()):
             return
         roi = self._get_roi_pct_clamped()
         # if clamped changed values, sync back to UI
@@ -132,9 +219,20 @@ class MainWindow(ctk.CTk):
             # show ROI overlay even before старт
             h, w = frame.shape[:2]
             roi = self._get_roi_pct_clamped()
-            roi_px = roi_pct_to_px(roi.x, roi.y, roi.w, roi.h, w, h)
+            dz = DangerZonePct(
+                x1=roi.x,
+                y1=roi.y,
+                x2=roi.x + roi.w,
+                y2=roi.y,
+                x3=roi.x + roi.w,
+                y3=roi.y + roi.h,
+                x4=roi.x,
+                y4=roi.y + roi.h,
+            ).clamp()
+            dz_px = danger_zone_pct_to_px(dz, w, h)
             tmp = frame.copy()
-            cv2.rectangle(tmp, (roi_px.x1, roi_px.y1), (roi_px.x2, roi_px.y2), (255, 200, 0), 2)
+            pts = [(dz_px.x1, dz_px.y1), (dz_px.x2, dz_px.y2), (dz_px.x3, dz_px.y3), (dz_px.x4, dz_px.y4)]
+            cv2.polylines(tmp, [np.array(pts, dtype=np.int32)], isClosed=True, color=(255, 200, 0), thickness=2)
             self._set_preview_bgr(tmp)
         finally:
             cap.release()
@@ -228,6 +326,18 @@ class MainWindow(ctk.CTk):
         self._add_roi_slider(frm_roi, "W", self.roi_w, 1, 100, base_row=5)
         self._add_roi_slider(frm_roi, "H", self.roi_h, 1, 100, base_row=7)
 
+        self.roi_auto_var = tk.BooleanVar(value=False)
+        self.chk_auto_roi = ctk.CTkCheckBox(
+            frm_roi,
+            text="Авто ROI (danger_zone)",
+            variable=self.roi_auto_var,
+            command=self._on_auto_roi_toggle,
+        )
+        self.chk_auto_roi.grid(row=9, column=0, sticky="w", padx=10, pady=(0, 6))
+
+        self.btn_roi_recalc = ctk.CTkButton(frm_roi, text="Пересчитать по кадру", command=lambda: self._auto_roi_recompute(force=True))
+        self.btn_roi_recalc.grid(row=9, column=1, sticky="e", padx=(0, 10), pady=(0, 6))
+
         # Export
         frm_exp = ctk.CTkFrame(left)
         frm_exp.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 12))
@@ -308,6 +418,7 @@ class MainWindow(ctk.CTk):
         # slider row
         s = ctk.CTkSlider(parent, from_=from_, to=to, variable=var, number_of_steps=int(to - from_))
         s.grid(row=base_row + 1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        self._roi_sliders.append(s)
 
     def _on_open_video(self) -> None:
         path = filedialog.askopenfilename(
@@ -425,6 +536,8 @@ class MainWindow(ctk.CTk):
 
     def _apply_frame(self, fr: FrameResult) -> None:
         self._last_frame = fr
+        if bool(self.roi_auto_var.get()):
+            self._auto_roi_recompute(force=False)
         self._render_preview_from_last()
 
 
