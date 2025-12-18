@@ -44,6 +44,8 @@ class MainWindow(ctk.CTk):
         self._road_color_thresh_var = tk.DoubleVar(value=7.5)
         self._road_debug_mode_var = tk.StringVar(value="Обычный")
         self._use_perspective_var = tk.BooleanVar(value=False)
+        self._dz_near_bottom_var = tk.DoubleVar(value=35.0)  # %
+        self._dz_edge_q_var = tk.DoubleVar(value=6.0)  # %
 
         self._build_ui()
         self._tick()
@@ -77,6 +79,8 @@ class MainWindow(ctk.CTk):
             color_dist_thresh=max(1.0, min(60.0, thr)),
             use_perspective=bool(self._use_perspective_var.get()),
             calib_path=DEFAULT_CALIB_PATH,
+            dz_near_bottom_frac=max(0.05, min(0.95, float(self._dz_near_bottom_var.get()) / 100.0)),
+            dz_edge_quantile=max(0.0, min(0.20, float(self._dz_edge_q_var.get()) / 100.0)),
         )
 
     def _on_perspective_toggle(self) -> None:
@@ -307,7 +311,7 @@ class MainWindow(ctk.CTk):
             self._auto_road_mask_u8 = rm.mask_u8
             self._auto_road_debug = None
 
-        est = danger_zone_pct_from_road_mask(self._auto_road_mask_u8)
+        est = danger_zone_pct_from_road_mask(self._auto_road_mask_u8, self._get_road_params())
         # 2) Fallback: old line-based trapezoid (still helpful if mask failed)
         if est is None:
             est = estimate_danger_zone_pct(fr.frame_bgr)
@@ -635,6 +639,43 @@ class MainWindow(ctk.CTk):
             ),
         )
 
+        # Danger-zone tuning from road mask
+        ctk.CTkLabel(frm_roi, text="Высота danger_zone от низа (%):", anchor="w", text_color="#bbb").grid(
+            row=19, column=0, sticky="w", padx=10, pady=(0, 0)
+        )
+        self._dz_near_bottom_lbl = ctk.CTkLabel(frm_roi, text="35", anchor="e", text_color="#bbb")
+        self._dz_near_bottom_lbl.grid(row=19, column=1, sticky="e", padx=(0, 10), pady=(0, 0))
+        self._dz_near_bottom_slider = ctk.CTkSlider(frm_roi, from_=15.0, to=60.0, variable=self._dz_near_bottom_var, number_of_steps=45)
+        self._dz_near_bottom_slider.grid(row=20, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
+        self._dz_near_bottom_var.trace_add(
+            "write",
+            lambda *_: (
+                self._dz_near_bottom_lbl.configure(text=f"{self._dz_near_bottom_var.get():.0f}"),
+                self._processor.set_road_params(dz_near_bottom_frac=float(self._dz_near_bottom_var.get()) / 100.0)
+                if self._processor.is_running()
+                else None,
+                self._auto_roi_recompute(force=True) if bool(self.roi_auto_var.get()) else self._render_preview_from_last(),
+            ),
+        )
+
+        ctk.CTkLabel(frm_roi, text="Отсечь края маски (%):", anchor="w", text_color="#bbb").grid(
+            row=21, column=0, sticky="w", padx=10, pady=(0, 0)
+        )
+        self._dz_edge_q_lbl = ctk.CTkLabel(frm_roi, text="6", anchor="e", text_color="#bbb")
+        self._dz_edge_q_lbl.grid(row=21, column=1, sticky="e", padx=(0, 10), pady=(0, 0))
+        self._dz_edge_q_slider = ctk.CTkSlider(frm_roi, from_=0.0, to=15.0, variable=self._dz_edge_q_var, number_of_steps=150)
+        self._dz_edge_q_slider.grid(row=22, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        self._dz_edge_q_var.trace_add(
+            "write",
+            lambda *_: (
+                self._dz_edge_q_lbl.configure(text=f"{self._dz_edge_q_var.get():.0f}"),
+                self._processor.set_road_params(dz_edge_quantile=float(self._dz_edge_q_var.get()) / 100.0)
+                if self._processor.is_running()
+                else None,
+                self._auto_roi_recompute(force=True) if bool(self.roi_auto_var.get()) else self._render_preview_from_last(),
+            ),
+        )
+
         # Debug view selector
         ctk.CTkLabel(frm_roi, text="Road Debug (превью):", anchor="w", text_color="#bbb").grid(
             row=15, column=0, sticky="w", padx=10, pady=(0, 0)
@@ -831,6 +872,8 @@ class MainWindow(ctk.CTk):
             self._processor.set_road_params(
                 color_dist_thresh=float(self._road_color_thresh_var.get()),
                 use_perspective=bool(self._use_perspective_var.get()),
+                dz_near_bottom_frac=float(self._dz_near_bottom_var.get()) / 100.0,
+                dz_edge_quantile=float(self._dz_edge_q_var.get()) / 100.0,
             )
             self.lbl_status.configure(text="Статус: воспроизведение…")
         except Exception as e:

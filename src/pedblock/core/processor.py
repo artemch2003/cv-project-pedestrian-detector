@@ -115,13 +115,24 @@ class VideoProcessor:
     def set_show_road_mask(self, enabled: bool) -> None:
         self._enqueue_ctrl(_ControlCmd(kind="show_road_mask", value=bool(enabled)))
 
-    def set_road_params(self, *, color_dist_thresh: float | None = None, use_perspective: bool | None = None) -> None:
+    def set_road_params(
+        self,
+        *,
+        color_dist_thresh: float | None = None,
+        use_perspective: bool | None = None,
+        dz_near_bottom_frac: float | None = None,
+        dz_edge_quantile: float | None = None,
+    ) -> None:
         # Keep the control message JSON/pickle-free: send only a tiny dict of primitives
         payload: dict[str, float] = {}
         if color_dist_thresh is not None:
             payload["color_dist_thresh"] = float(color_dist_thresh)
         if use_perspective is not None:
             payload["use_perspective"] = 1.0 if bool(use_perspective) else 0.0
+        if dz_near_bottom_frac is not None:
+            payload["dz_near_bottom_frac"] = float(dz_near_bottom_frac)
+        if dz_edge_quantile is not None:
+            payload["dz_edge_quantile"] = float(dz_edge_quantile)
         self._enqueue_ctrl(_ControlCmd(kind="road_params", value=payload))
 
     def set_danger_zone_pct(self, dz: DangerZonePct) -> None:
@@ -248,17 +259,30 @@ class VideoProcessor:
                     d = dict(cmd.value or {})  # type: ignore[arg-type]
                     thr = d.get("color_dist_thresh", None)
                     up = d.get("use_perspective", None)
+                    nb = d.get("dz_near_bottom_frac", None)
+                    dq = d.get("dz_edge_quantile", None)
                     if thr is not None:
                         thr_f = float(thr)
                         thr_f = max(1.0, min(60.0, thr_f))
                         self._road_params = RoadAreaParams(
                             color_dist_thresh=thr_f,
                             use_perspective=bool(up) if up is not None else bool(self._road_params.use_perspective),
+                            dz_near_bottom_frac=float(nb) if nb is not None else float(self._road_params.dz_near_bottom_frac),
+                            dz_edge_quantile=float(dq) if dq is not None else float(self._road_params.dz_edge_quantile),
                         )
                     elif up is not None:
                         self._road_params = RoadAreaParams(
                             color_dist_thresh=float(self._road_params.color_dist_thresh),
                             use_perspective=bool(up),
+                            dz_near_bottom_frac=float(nb) if nb is not None else float(self._road_params.dz_near_bottom_frac),
+                            dz_edge_quantile=float(dq) if dq is not None else float(self._road_params.dz_edge_quantile),
+                        )
+                    elif nb is not None or dq is not None:
+                        self._road_params = RoadAreaParams(
+                            color_dist_thresh=float(self._road_params.color_dist_thresh),
+                            use_perspective=bool(self._road_params.use_perspective),
+                            dz_near_bottom_frac=float(nb) if nb is not None else float(self._road_params.dz_near_bottom_frac),
+                            dz_edge_quantile=float(dq) if dq is not None else float(self._road_params.dz_edge_quantile),
                         )
                 except Exception:
                     pass
@@ -358,7 +382,7 @@ class VideoProcessor:
                     road_params = self._road_params
                     rm = estimate_road_mask(frame, road_params)
                     road_mask_u8 = rm.mask_u8
-                    est = danger_zone_pct_from_road_mask(road_mask_u8)
+                    est = danger_zone_pct_from_road_mask(road_mask_u8, road_params)
                     if est is not None:
                         prev = road_dz_smoothed
                         if prev is None:

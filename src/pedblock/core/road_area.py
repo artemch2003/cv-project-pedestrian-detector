@@ -80,6 +80,20 @@ class RoadAreaParams:
     # Минимальная площадь компоненты (в долях кадра) для принятия маски
     min_cc_area_frac: float = 0.03
 
+    # ==== DangerZone-from-mask tuning ====
+    # Какая часть маски (снизу) используется для построения трапеции danger_zone.
+    dz_near_bottom_frac: float = 0.35
+    # Насколько “отрезать” края маски (квантили). 0.06 => берём 6..94% по X,
+    # чтобы игнорировать шумные островки у границ.
+    dz_edge_quantile: float = 0.06
+    # Доп. морфология перед извлечением границ danger_zone (устойчивость на дожде/бликах).
+    dz_close_ksize: int = 15
+    dz_open_ksize: int = 5
+    # Минимальная ширина трапеции на ближней границе (доля кадра).
+    dz_min_width_frac: float = 0.18
+    # Позиции (фракции) внутри near-band по Y, по которым оцениваем границы и фитчим линии.
+    dz_sample_fracs: tuple[float, float, float, float] = (0.10, 0.35, 0.65, 0.95)
+
 
 @dataclass(frozen=True, slots=True)
 class RoadMaskResult:
@@ -476,7 +490,12 @@ def _refine_mask_by_color_cc(
     return out
 
 
-def danger_zone_pct_from_road_mask(mask_u8: np.ndarray, *, near_bottom_frac: float = 0.35) -> DangerZonePct | None:
+def danger_zone_pct_from_road_mask(
+    mask_u8: np.ndarray,
+    params: RoadAreaParams | None = None,
+    *,
+    near_bottom_frac: float | None = None,
+) -> DangerZonePct | None:
     """
     Строит danger_zone (трапецию) по маске проезжей части.
 
@@ -492,6 +511,9 @@ def danger_zone_pct_from_road_mask(mask_u8: np.ndarray, *, near_bottom_frac: flo
     if w <= 1 or h <= 1:
         return None
 
+    p = params or RoadAreaParams()
+    if near_bottom_frac is None:
+        near_bottom_frac = float(p.dz_near_bottom_frac)
     near_bottom_frac = float(max(0.05, min(0.95, near_bottom_frac)))
     band_h = int(round(h * near_bottom_frac))
     y1 = max(0, h - band_h)
@@ -502,8 +524,8 @@ def danger_zone_pct_from_road_mask(mask_u8: np.ndarray, *, near_bottom_frac: flo
     # 0) Cleanup for stability: fill small holes + keep only component connected to the bottom.
     try:
         m = (mask_u8 > 0).astype(np.uint8) * 255
-        ck = 15  # close holes / bridges in rainy footage
-        ok = 5
+        ck = int(max(3, int(p.dz_close_ksize) // 2 * 2 + 1))  # odd >=3
+        ok = int(max(3, int(p.dz_open_ksize) // 2 * 2 + 1))   # odd >=3
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((ck, ck), np.uint8), iterations=1)
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((ok, ok), np.uint8), iterations=1)
 
@@ -526,7 +548,7 @@ def danger_zone_pct_from_road_mask(mask_u8: np.ndarray, *, near_bottom_frac: flo
         m_u8 = (mask_u8 > 0).astype(np.uint8) * 255
 
     # helper: robust left/right estimation at a y (use a small window + quantiles)
-    def lr_at(y: int, win: int = 8, *, q: float = 0.06) -> tuple[float, float] | None:
+    def lr_at(y: int, win: int = 8, *, q: float) -> tuple[float, float] | None:
         ys = range(max(y1, y - win), min(y2, y + win) + 1)
         lefts: list[float] = []
         rights: list[float] = []
@@ -546,16 +568,14 @@ def danger_zone_pct_from_road_mask(mask_u8: np.ndarray, *, near_bottom_frac: flo
         return (float(np.median(lefts)), float(np.median(rights)))
 
     # Sample multiple y positions and smooth by fitting left/right as a function of y.
-    ys_samp = [
-        int(round(y1 + 0.10 * (y2 - y1))),
-        int(round(y1 + 0.35 * (y2 - y1))),
-        int(round(y1 + 0.65 * (y2 - y1))),
-        int(round(y2 - 0.05 * (y2 - y1))),
-    ]
+    frs = getattr(p, "dz_sample_fracs", (0.10, 0.35, 0.65, 0.95))
+    frs = tuple(float(max(0.0, min(1.0, f))) for f in frs)
+    q = float(max(0.0, min(0.20, float(p.dz_edge_quantile))))
+    ys_samp = [int(round(y1 + f * (y2 - y1))) for f in frs]
     pts_l: list[tuple[float, float]] = []
     pts_r: list[tuple[float, float]] = []
     for yy in ys_samp:
-        lr = lr_at(int(yy))
+        lr = lr_at(int(yy), q=q)
         if lr is None:
             continue
         xl, xr = lr
@@ -591,7 +611,7 @@ def danger_zone_pct_from_road_mask(mask_u8: np.ndarray, *, near_bottom_frac: flo
         return float(max(0.0, min(float(w - 1), v)))
 
     x1_t, x2_t, x1_b, x2_b = cx(x1_t), cx(x2_t), cx(x1_b), cx(x2_b)
-    if (x2_b - x1_b) < max(20.0, 0.18 * float(w)):
+    if (x2_b - x1_b) < max(20.0, float(p.dz_min_width_frac) * float(w)):
         return None
 
     # convert to percent trapezoid
