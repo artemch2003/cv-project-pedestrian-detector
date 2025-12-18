@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from pedblock.core.camera_calib import DEFAULT_CALIB_PATH, load_camera_calib
 from pedblock.core.danger_zone import DangerZonePct
 
 
@@ -59,6 +60,12 @@ class RoadAreaParams:
     # - "hybrid": коридор (геометрия) + цветовая сегментация + CC (обычно точнее)
     method: str = "hybrid"
 
+    # OpenADAS-style: если есть калибровка гомографии, можно строить маску в bird-view и
+    # проецировать обратно на исходный кадр. Это делает выделение дороги стабильнее на
+    # видео с сильной перспективой (как в статье OpenADAS).
+    use_perspective: bool = False
+    calib_path: str = DEFAULT_CALIB_PATH
+
     # Настройки цветовой сегментации (hybrid)
     color_space: str = "lab"  # lab|hsv
     # Откуда берём “эталонный цвет дороги”: полоса у низа кадра
@@ -80,6 +87,16 @@ class RoadMaskResult:
     polygon_px: list[tuple[int, int]]  # по часовой: TL, TR, BR, BL (если удалось)
 
 
+@dataclass(frozen=True, slots=True)
+class RoadDebug:
+    edges_u8: np.ndarray | None = None
+    corridor_mask_u8: np.ndarray | None = None
+    seed_mask_u8: np.ndarray | None = None
+    color_dist_u8: np.ndarray | None = None  # 0..255 (меньше = ближе к “дороге”)
+    color_cand_u8: np.ndarray | None = None
+    cc_selected_u8: np.ndarray | None = None
+
+
 def estimate_road_mask(frame_bgr: np.ndarray, params: RoadAreaParams | None = None) -> RoadMaskResult:
     p = params or RoadAreaParams()
     if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
@@ -89,13 +106,42 @@ def estimate_road_mask(frame_bgr: np.ndarray, params: RoadAreaParams | None = No
     if w <= 1 or h <= 1:
         return _fallback_mask(frame_bgr, p)
 
+    # Optional perspective mode (OpenADAS-style): compute dense road mask in bird-view
+    # and warp it back to the original image coordinates.
+    if bool(getattr(p, "use_perspective", False)):
+        calib = load_camera_calib(getattr(p, "calib_path", DEFAULT_CALIB_PATH))
+        if calib is not None:
+            try:
+                bev = calib.build_birdeye(frame_w=w, frame_h=h)
+                frame_bev = bev.warp_to_bev(frame_bgr)
+                # In BEV, the "lane line" slopes may become vertical, so avoid Hough-corridor
+                # and rely on color+CC connectivity from the bottom band.
+                corridor_all = np.ones(frame_bev.shape[:2], dtype=np.uint8) * 255
+                refined_bev = _refine_mask_by_color_cc(frame_bev, corridor_all, p, debug=None)
+                if refined_bev is not None:
+                    mask_back = bev.warp_mask_to_frame(refined_bev)
+                    # ensure binary-ish u8 {0,255}
+                    mask_back = (mask_back > 0).astype(np.uint8) * 255
+                    return RoadMaskResult(mask_u8=mask_back, polygon_px=[])
+            except Exception:
+                # fail open: fallback to non-perspective mode
+                pass
+
     method = (p.method or "hybrid").strip().lower()
     if method not in ("hybrid", "hough"):
         method = "hybrid"
 
     # 1) Build a geometric corridor by lines (always our strongest geometric prior).
-    corridor = _estimate_corridor_from_lines(frame_bgr, p)
+    corridor = _estimate_corridor_from_lines(frame_bgr, p, debug=None)
     if corridor is None:
+        # If line-based corridor failed (rain, glare, no markings),
+        # try "color-only" drivable area as a fallback (still adaptive).
+        if method == "hybrid":
+            h, w = frame_bgr.shape[:2]
+            corridor_all = np.ones((h, w), dtype=np.uint8) * 255
+            refined = _refine_mask_by_color_cc(frame_bgr, corridor_all, p, debug=None)
+            if refined is not None:
+                return RoadMaskResult(mask_u8=refined, polygon_px=[])
         return _fallback_mask(frame_bgr, p)
     corridor_mask, poly = corridor
 
@@ -103,14 +149,102 @@ def estimate_road_mask(frame_bgr: np.ndarray, params: RoadAreaParams | None = No
         return RoadMaskResult(mask_u8=corridor_mask, polygon_px=poly)
 
     # 2) Hybrid: refine to a dense drivable-area mask using color similarity + connected components.
-    refined = _refine_mask_by_color_cc(frame_bgr, corridor_mask, p)
+    refined = _refine_mask_by_color_cc(frame_bgr, corridor_mask, p, debug=None)
     if refined is None:
         # if refinement failed, return corridor-only (still usable)
         return RoadMaskResult(mask_u8=corridor_mask, polygon_px=poly)
     return RoadMaskResult(mask_u8=refined, polygon_px=poly)
 
 
-def _estimate_corridor_from_lines(frame_bgr: np.ndarray, p: RoadAreaParams) -> tuple[np.ndarray, list[tuple[int, int]]] | None:
+def estimate_road_mask_debug(frame_bgr: np.ndarray, params: RoadAreaParams | None = None) -> tuple[RoadMaskResult, RoadDebug]:
+    """
+    Как estimate_road_mask, но дополнительно возвращает промежуточные карты для отладки в UI.
+    """
+    p = params or RoadAreaParams()
+    if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
+        fb = _fallback_mask(frame_bgr, p)
+        return fb, RoadDebug()
+
+    h, w = frame_bgr.shape[:2]
+    if w <= 1 or h <= 1:
+        fb = _fallback_mask(frame_bgr, p)
+        return fb, RoadDebug()
+
+    # Perspective mode debug: return BEV intermediates as best-effort grayscale maps.
+    if bool(getattr(p, "use_perspective", False)):
+        calib = load_camera_calib(getattr(p, "calib_path", DEFAULT_CALIB_PATH))
+        if calib is not None:
+            try:
+                bev = calib.build_birdeye(frame_w=w, frame_h=h)
+                frame_bev = bev.warp_to_bev(frame_bgr)
+                corridor_all = np.ones(frame_bev.shape[:2], dtype=np.uint8) * 255
+                store: dict[str, np.ndarray] = {}
+                refined_bev = _refine_mask_by_color_cc(frame_bev, corridor_all, p, debug=store)
+                if refined_bev is not None:
+                    mask_back = bev.warp_mask_to_frame(refined_bev)
+                    mask_back = (mask_back > 0).astype(np.uint8) * 255
+                    dbg = RoadDebug(
+                        edges_u8=None,
+                        corridor_mask_u8=None,
+                        seed_mask_u8=store.get("seed_mask_u8"),
+                        color_dist_u8=store.get("color_dist_u8"),
+                        color_cand_u8=store.get("color_cand_u8"),
+                        cc_selected_u8=store.get("cc_selected_u8"),
+                    )
+                    return RoadMaskResult(mask_u8=mask_back, polygon_px=[]), dbg
+            except Exception:
+                pass
+
+    method = (p.method or "hybrid").strip().lower()
+    if method not in ("hybrid", "hough"):
+        method = "hybrid"
+
+    dbg = RoadDebug()
+    corridor = _estimate_corridor_from_lines(frame_bgr, p, debug={"edges": True})
+    if corridor is None:
+        # Debug: try the adaptive "color-only" fallback before giving up to a static trapezoid.
+        if method != "hough":
+            h, w = frame_bgr.shape[:2]
+            corridor_all = np.ones((h, w), dtype=np.uint8) * 255
+            store: dict[str, np.ndarray] = {}
+            refined = _refine_mask_by_color_cc(frame_bgr, corridor_all, p, debug=store)
+            if refined is not None:
+                dbg = RoadDebug(
+                    edges_u8=None,
+                    corridor_mask_u8=None,
+                    seed_mask_u8=store.get("seed_mask_u8"),
+                    color_dist_u8=store.get("color_dist_u8"),
+                    color_cand_u8=store.get("color_cand_u8"),
+                    cc_selected_u8=store.get("cc_selected_u8"),
+                )
+                return RoadMaskResult(mask_u8=refined, polygon_px=[]), dbg
+        fb = _fallback_mask(frame_bgr, p)
+        return fb, dbg
+    corridor_mask, poly, edges_u8 = corridor
+    dbg = RoadDebug(edges_u8=edges_u8, corridor_mask_u8=corridor_mask)
+
+    if method == "hough":
+        return RoadMaskResult(mask_u8=corridor_mask, polygon_px=poly), dbg
+
+    debug_store: dict[str, np.ndarray] = {}
+    refined = _refine_mask_by_color_cc(frame_bgr, corridor_mask, p, debug=debug_store)
+    if refined is None:
+        return RoadMaskResult(mask_u8=corridor_mask, polygon_px=poly), dbg
+
+    dbg = RoadDebug(
+        edges_u8=edges_u8,
+        corridor_mask_u8=corridor_mask,
+        seed_mask_u8=debug_store.get("seed_mask_u8"),
+        color_dist_u8=debug_store.get("color_dist_u8"),
+        color_cand_u8=debug_store.get("color_cand_u8"),
+        cc_selected_u8=debug_store.get("cc_selected_u8"),
+    )
+    return RoadMaskResult(mask_u8=refined, polygon_px=poly), dbg
+
+
+def _estimate_corridor_from_lines(
+    frame_bgr: np.ndarray, p: RoadAreaParams, *, debug: dict | None
+) -> tuple[np.ndarray, list[tuple[int, int]], np.ndarray] | tuple[np.ndarray, list[tuple[int, int]]] | None:
     """
     Строит грубую маску-коридор (трапеция) между левой/правой «дорожными» линиями.
     Возвращает (mask_u8, polygon_px).
@@ -226,10 +360,14 @@ def _estimate_corridor_from_lines(frame_bgr: np.ndarray, p: RoadAreaParams) -> t
 
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(mask, [np.array(poly, dtype=np.int32)], 255)
+    if debug is not None:
+        return (mask, poly, edges)
     return (mask, poly)
 
 
-def _refine_mask_by_color_cc(frame_bgr: np.ndarray, corridor_mask_u8: np.ndarray, p: RoadAreaParams) -> np.ndarray | None:
+def _refine_mask_by_color_cc(
+    frame_bgr: np.ndarray, corridor_mask_u8: np.ndarray, p: RoadAreaParams, *, debug: dict[str, np.ndarray] | None
+) -> np.ndarray | None:
     """
     Уточнение маски «проезжей части»:
     - обучаем простой цветовой “модель дороги” по нижней центральной полосе (внутри коридора),
@@ -251,6 +389,8 @@ def _refine_mask_by_color_cc(frame_bgr: np.ndarray, corridor_mask_u8: np.ndarray
     seed_mask = np.zeros((h, w), dtype=np.uint8)
     seed_mask[y0:h, x0:x1] = 255
     seed_mask = cv2.bitwise_and(seed_mask, corridor_mask_u8)
+    if debug is not None:
+        debug["seed_mask_u8"] = seed_mask.copy()
 
     ys, xs = np.where(seed_mask > 0)
     if ys.size < 250:
@@ -277,6 +417,12 @@ def _refine_mask_by_color_cc(frame_bgr: np.ndarray, corridor_mask_u8: np.ndarray
 
     thr = float(max(1.0, min(60.0, p.color_dist_thresh)))
     cand = (dist < thr).astype(np.uint8) * 255
+    if debug is not None:
+        # normalize for visualization (clip to 0..thr*3)
+        vmax = max(1.0, float(thr * 3.0))
+        vis = np.clip((dist / vmax) * 255.0, 0.0, 255.0).astype(np.uint8)
+        debug["color_dist_u8"] = vis
+        debug["color_cand_u8"] = cand.copy()
 
     # Keep only bottom-ish region to avoid leaking into sky/buildings.
     y_cut = int(round(h * float(p.analyze_top_frac)))
@@ -325,6 +471,8 @@ def _refine_mask_by_color_cc(frame_bgr: np.ndarray, corridor_mask_u8: np.ndarray
     out = (labels == best).astype(np.uint8) * 255
     # Final clamp by dilated corridor (safety)
     out = cv2.bitwise_and(out, dil)
+    if debug is not None:
+        debug["cc_selected_u8"] = out.copy()
     return out
 
 
@@ -351,31 +499,99 @@ def danger_zone_pct_from_road_mask(mask_u8: np.ndarray, *, near_bottom_frac: flo
     if y2 <= y1:
         return None
 
-    # helper: robust left/right estimation at a y (use a small window)
-    def lr_at(y: int, win: int = 6) -> tuple[float, float] | None:
+    # 0) Cleanup for stability: fill small holes + keep only component connected to the bottom.
+    try:
+        m = (mask_u8 > 0).astype(np.uint8) * 255
+        ck = 15  # close holes / bridges in rainy footage
+        ok = 5
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((ck, ck), np.uint8), iterations=1)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((ok, ok), np.uint8), iterations=1)
+
+        num, labels, stats, _ = cv2.connectedComponentsWithStats((m > 0).astype(np.uint8), connectivity=8)
+        if num > 1:
+            bottom_y = h - 1
+            bottom_labels = labels[bottom_y, :]
+            present = np.unique(bottom_labels[bottom_labels > 0])
+            best = -1
+            best_area = 0
+            for lab in present.tolist():
+                area = int(stats[int(lab), cv2.CC_STAT_AREA])
+                if area > best_area:
+                    best_area = area
+                    best = int(lab)
+            if best > 0:
+                m = (labels == best).astype(np.uint8) * 255
+        m_u8 = m
+    except Exception:
+        m_u8 = (mask_u8 > 0).astype(np.uint8) * 255
+
+    # helper: robust left/right estimation at a y (use a small window + quantiles)
+    def lr_at(y: int, win: int = 8, *, q: float = 0.06) -> tuple[float, float] | None:
         ys = range(max(y1, y - win), min(y2, y + win) + 1)
-        lefts: list[int] = []
-        rights: list[int] = []
+        lefts: list[float] = []
+        rights: list[float] = []
         for yy in ys:
-            xs = np.flatnonzero(mask_u8[yy, :] > 0)
-            if xs.size < 8:
+            xs = np.flatnonzero(m_u8[yy, :] > 0)
+            if xs.size < 40:
                 continue
-            lefts.append(int(xs[0]))
-            rights.append(int(xs[-1]))
+            # Use quantiles to ignore small noisy islands near edges.
+            lq = float(np.quantile(xs.astype(np.float32), q))
+            rq = float(np.quantile(xs.astype(np.float32), 1.0 - q))
+            if rq <= lq:
+                continue
+            lefts.append(lq)
+            rights.append(rq)
         if len(lefts) < 3 or len(rights) < 3:
             return None
         return (float(np.median(lefts)), float(np.median(rights)))
 
-    # top of near-band and bottom
-    y_top = int(round(y1 + 0.10 * (y2 - y1)))
-    y_bot = int(round(y2 - 0.05 * (y2 - y1)))
-    lr_t = lr_at(y_top)
-    lr_b = lr_at(y_bot)
-    if lr_t is None or lr_b is None:
+    # Sample multiple y positions and smooth by fitting left/right as a function of y.
+    ys_samp = [
+        int(round(y1 + 0.10 * (y2 - y1))),
+        int(round(y1 + 0.35 * (y2 - y1))),
+        int(round(y1 + 0.65 * (y2 - y1))),
+        int(round(y2 - 0.05 * (y2 - y1))),
+    ]
+    pts_l: list[tuple[float, float]] = []
+    pts_r: list[tuple[float, float]] = []
+    for yy in ys_samp:
+        lr = lr_at(int(yy))
+        if lr is None:
+            continue
+        xl, xr = lr
+        pts_l.append((float(yy), float(xl)))
+        pts_r.append((float(yy), float(xr)))
+    if len(pts_l) < 2 or len(pts_r) < 2:
         return None
-    x1_t, x2_t = lr_t
-    x1_b, x2_b = lr_b
+
+    # Fit x = a*y + b (least squares) for left and right boundaries.
+    def fit_line_yx(samples: list[tuple[float, float]]) -> tuple[float, float]:
+        Y = np.array([s[0] for s in samples], dtype=np.float32)
+        X = np.array([s[1] for s in samples], dtype=np.float32)
+        A = np.stack([Y, np.ones_like(Y)], axis=1)
+        coef, _, _, _ = np.linalg.lstsq(A, X, rcond=None)
+        a = float(coef[0])
+        b = float(coef[1])
+        return a, b
+
+    aL, bL = fit_line_yx(pts_l)
+    aR, bR = fit_line_yx(pts_r)
+
+    y_top = float(min(ys_samp))
+    y_bot = float(max(ys_samp))
+    x1_t = aL * y_top + bL
+    x2_t = aR * y_top + bR
+    x1_b = aL * y_bot + bL
+    x2_b = aR * y_bot + bR
     if x2_t <= x1_t or x2_b <= x1_b:
+        return None
+
+    # Clamp + minimal width sanity relative to frame
+    def cx(v: float) -> float:
+        return float(max(0.0, min(float(w - 1), v)))
+
+    x1_t, x2_t, x1_b, x2_b = cx(x1_t), cx(x2_t), cx(x1_b), cx(x2_b)
+    if (x2_b - x1_b) < max(20.0, 0.18 * float(w)):
         return None
 
     # convert to percent trapezoid

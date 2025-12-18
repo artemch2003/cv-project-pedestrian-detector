@@ -67,6 +67,7 @@ class VideoProcessor:
         self._danger_zone_manual_override = False
         self._danger_zone_mode = "roi"
         self._show_road_mask = False
+        self._road_params = RoadAreaParams()
 
     def start(self, video_path: str, det_cfg: DetectionConfig, exp_cfg: ExportConfig) -> None:
         with self._running_lock:
@@ -113,6 +114,15 @@ class VideoProcessor:
 
     def set_show_road_mask(self, enabled: bool) -> None:
         self._enqueue_ctrl(_ControlCmd(kind="show_road_mask", value=bool(enabled)))
+
+    def set_road_params(self, *, color_dist_thresh: float | None = None, use_perspective: bool | None = None) -> None:
+        # Keep the control message JSON/pickle-free: send only a tiny dict of primitives
+        payload: dict[str, float] = {}
+        if color_dist_thresh is not None:
+            payload["color_dist_thresh"] = float(color_dist_thresh)
+        if use_perspective is not None:
+            payload["use_perspective"] = 1.0 if bool(use_perspective) else 0.0
+        self._enqueue_ctrl(_ControlCmd(kind="road_params", value=payload))
 
     def set_danger_zone_pct(self, dz: DangerZonePct) -> None:
         dz = DangerZonePct(points=[(float(x), float(y)) for (x, y) in dz.points]).clamp()
@@ -201,7 +211,9 @@ class VideoProcessor:
                     for i in range(0, len(flat) - 1, 2):
                         pts.append((float(flat[i]), float(flat[i + 1])))
                     self._danger_zone_pct = DangerZonePct(points=pts).clamp()
-                    self._danger_zone_manual_override = True
+                    # Если мы в режиме "road", полигон может приходить как подсказка/фоллбек,
+                    # но не должен отключать road-based расчёт на каждом кадре.
+                    self._danger_zone_manual_override = bool(self._danger_zone_mode != "road")
                 except Exception:
                     pass
             elif cmd.kind == "danger_zone_mode":
@@ -229,6 +241,25 @@ class VideoProcessor:
             elif cmd.kind == "show_road_mask":
                 try:
                     self._show_road_mask = bool(cmd.value)
+                except Exception:
+                    pass
+            elif cmd.kind == "road_params":
+                try:
+                    d = dict(cmd.value or {})  # type: ignore[arg-type]
+                    thr = d.get("color_dist_thresh", None)
+                    up = d.get("use_perspective", None)
+                    if thr is not None:
+                        thr_f = float(thr)
+                        thr_f = max(1.0, min(60.0, thr_f))
+                        self._road_params = RoadAreaParams(
+                            color_dist_thresh=thr_f,
+                            use_perspective=bool(up) if up is not None else bool(self._road_params.use_perspective),
+                        )
+                    elif up is not None:
+                        self._road_params = RoadAreaParams(
+                            color_dist_thresh=float(self._road_params.color_dist_thresh),
+                            use_perspective=bool(up),
+                        )
                 except Exception:
                     pass
 
@@ -296,11 +327,12 @@ class VideoProcessor:
         if self._danger_zone_mode not in ("roi", "road"):
             self._danger_zone_mode = "roi"
         self._show_road_mask = bool(det_cfg.show_road_mask)
+        self._road_params = RoadAreaParams()
 
         # road-based danger zone smoothing (best-effort)
         road_dz_smoothed: DangerZonePct | None = None
         road_alpha = 0.25
-        road_params = RoadAreaParams()
+        road_params = self._road_params
 
         try:
             while not self._stop_event.is_set():
@@ -323,6 +355,7 @@ class VideoProcessor:
                 mode = (self._danger_zone_mode or "roi").strip().lower()
                 if mode == "road" and not self._danger_zone_manual_override:
                     # detect drivable area mask and derive danger zone from it
+                    road_params = self._road_params
                     rm = estimate_road_mask(frame, road_params)
                     road_mask_u8 = rm.mask_u8
                     est = danger_zone_pct_from_road_mask(road_mask_u8)
