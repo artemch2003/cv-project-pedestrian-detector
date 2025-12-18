@@ -93,6 +93,10 @@ class RoadAreaParams:
     dz_min_width_frac: float = 0.18
     # Позиции (фракции) внутри near-band по Y, по которым оцениваем границы и фитчим линии.
     dz_sample_fracs: tuple[float, float, float, float] = (0.10, 0.35, 0.65, 0.95)
+    # Способ построения danger_zone из маски:
+    # - "fit": как раньше — фитим левую/правую границу как x = a*y + b по нескольким срезам
+    # - "max_width": нижнее основание берём по строке с максимальной шириной маски (в near-band)
+    dz_method: str = "fit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -568,43 +572,84 @@ def danger_zone_pct_from_road_mask(
         return (float(np.median(lefts)), float(np.median(rights)))
 
     # Sample multiple y positions and smooth by fitting left/right as a function of y.
-    frs = getattr(p, "dz_sample_fracs", (0.10, 0.35, 0.65, 0.95))
-    frs = tuple(float(max(0.0, min(1.0, f))) for f in frs)
     q = float(max(0.0, min(0.20, float(p.dz_edge_quantile))))
-    ys_samp = [int(round(y1 + f * (y2 - y1))) for f in frs]
-    pts_l: list[tuple[float, float]] = []
-    pts_r: list[tuple[float, float]] = []
-    for yy in ys_samp:
-        lr = lr_at(int(yy), q=q)
-        if lr is None:
-            continue
-        xl, xr = lr
-        pts_l.append((float(yy), float(xl)))
-        pts_r.append((float(yy), float(xr)))
-    if len(pts_l) < 2 or len(pts_r) < 2:
-        return None
+    method = str(getattr(p, "dz_method", "fit") or "fit").strip().lower()
+    if method in ("max_width", "maxwidth", "max-width", "max"):
+        # Width-only mode: keep trapezoid height fixed (y_top=y1, y_bot=y2),
+        # but allow the *width* (x extents) to vary based on the road mask.
+        #
+        # Bottom width: take the row within [y1..y2] where the mask span is maximal (robust quantile span),
+        # and use its (x_left, x_right) as the bottom base (while keeping y at y2).
+        best_y: int | None = None
+        best_lr: tuple[float, float] | None = None
+        best_w: float = -1.0
+        stride = 2  # cheap & stable; still precise enough for % conversion
+        for yy in range(int(y1), int(y2) + 1, stride):
+            lr = lr_at(int(yy), q=q)
+            if lr is None:
+                continue
+            xl, xr = lr
+            ww = float(xr - xl)
+            # Prefer larger width; if equal, prefer the *lower* row (closer to bottom),
+            # so we don't degenerate into a zero-height trapezoid on constant-width masks.
+            if (ww > best_w + 1e-6) or (abs(ww - best_w) <= 1e-6 and (best_y is None or int(yy) > int(best_y))):
+                best_w = ww
+                best_y = int(yy)
+                best_lr = (float(xl), float(xr))
+        if best_y is None or best_lr is None or best_w <= 0:
+            return None
 
-    # Fit x = a*y + b (least squares) for left and right boundaries.
-    def fit_line_yx(samples: list[tuple[float, float]]) -> tuple[float, float]:
-        Y = np.array([s[0] for s in samples], dtype=np.float32)
-        X = np.array([s[1] for s in samples], dtype=np.float32)
-        A = np.stack([Y, np.ones_like(Y)], axis=1)
-        coef, _, _, _ = np.linalg.lstsq(A, X, rcond=None)
-        a = float(coef[0])
-        b = float(coef[1])
-        return a, b
+        y_top = float(y1)
+        y_bot = float(y2)
+        x1_b, x2_b = best_lr
 
-    aL, bL = fit_line_yx(pts_l)
-    aR, bR = fit_line_yx(pts_r)
+        # Top width: try to read mask boundaries at the fixed top of the band (y1).
+        lr0 = lr_at(int(y1), q=q)
+        if lr0 is not None:
+            x1_t, x2_t = float(lr0[0]), float(lr0[1])
+        else:
+            # Fallback: shrink bottom width around center to form a trapezoid.
+            target_w = float(best_w) * 0.60
+            cx0 = 0.5 * float(x1_b + x2_b)
+            x1_t = cx0 - 0.5 * target_w
+            x2_t = cx0 + 0.5 * target_w
+    else:
+        frs = getattr(p, "dz_sample_fracs", (0.10, 0.35, 0.65, 0.95))
+        frs = tuple(float(max(0.0, min(1.0, f))) for f in frs)
+        ys_samp = [int(round(y1 + f * (y2 - y1))) for f in frs]
+        pts_l: list[tuple[float, float]] = []
+        pts_r: list[tuple[float, float]] = []
+        for yy in ys_samp:
+            lr = lr_at(int(yy), q=q)
+            if lr is None:
+                continue
+            xl, xr = lr
+            pts_l.append((float(yy), float(xl)))
+            pts_r.append((float(yy), float(xr)))
+        if len(pts_l) < 2 or len(pts_r) < 2:
+            return None
 
-    y_top = float(min(ys_samp))
-    y_bot = float(max(ys_samp))
-    x1_t = aL * y_top + bL
-    x2_t = aR * y_top + bR
-    x1_b = aL * y_bot + bL
-    x2_b = aR * y_bot + bR
-    if x2_t <= x1_t or x2_b <= x1_b:
-        return None
+        # Fit x = a*y + b (least squares) for left and right boundaries.
+        def fit_line_yx(samples: list[tuple[float, float]]) -> tuple[float, float]:
+            Y = np.array([s[0] for s in samples], dtype=np.float32)
+            X = np.array([s[1] for s in samples], dtype=np.float32)
+            A = np.stack([Y, np.ones_like(Y)], axis=1)
+            coef, _, _, _ = np.linalg.lstsq(A, X, rcond=None)
+            a = float(coef[0])
+            b = float(coef[1])
+            return a, b
+
+        aL, bL = fit_line_yx(pts_l)
+        aR, bR = fit_line_yx(pts_r)
+
+        y_top = float(min(ys_samp))
+        y_bot = float(max(ys_samp))
+        x1_t = aL * y_top + bL
+        x2_t = aR * y_top + bR
+        x1_b = aL * y_bot + bL
+        x2_b = aR * y_bot + bR
+        if x2_t <= x1_t or x2_b <= x1_b:
+            return None
 
     # Clamp + minimal width sanity relative to frame
     def cx(v: float) -> float:

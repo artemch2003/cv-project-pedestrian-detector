@@ -47,6 +47,7 @@ class MainWindow(ctk.CTk):
         self._use_perspective_var = tk.BooleanVar(value=False)
         self._dz_near_bottom_var = tk.DoubleVar(value=35.0)  # %
         self._dz_edge_q_var = tk.DoubleVar(value=6.0)  # %
+        self._dz_max_width_var = tk.BooleanVar(value=False)
 
         # Preview cache: allows "повторный просмотр" без пересчёта маски/авто danger_zone.
         # Храним только последние N кадров (LRU), иначе память улетит на длинных видео.
@@ -76,6 +77,7 @@ class MainWindow(ctk.CTk):
             bool(rp.use_perspective),
             float(rp.dz_near_bottom_frac),
             float(rp.dz_edge_quantile),
+            str(getattr(rp, "dz_method", "fit") or "fit"),
             calib_mtime,
         )
 
@@ -160,6 +162,7 @@ class MainWindow(ctk.CTk):
             calib_path=DEFAULT_CALIB_PATH,
             dz_near_bottom_frac=max(0.05, min(0.95, float(self._dz_near_bottom_var.get()) / 100.0)),
             dz_edge_quantile=max(0.0, min(0.20, float(self._dz_edge_q_var.get()) / 100.0)),
+            dz_method=("max_width" if bool(self._dz_max_width_var.get()) else "fit"),
         )
 
     def _on_perspective_toggle(self) -> None:
@@ -777,6 +780,23 @@ class MainWindow(ctk.CTk):
             ),
         )
 
+        # Danger-zone method from road mask
+        self._dz_max_width_chk = ctk.CTkCheckBox(
+            frm_roi,
+            text="Трапеция по макс. ширине маски дороги",
+            variable=self._dz_max_width_var,
+        )
+        self._dz_max_width_chk.grid(row=23, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
+        self._dz_max_width_var.trace_add(
+            "write",
+            lambda *_: (
+                self._processor.set_road_params(dz_method=("max_width" if bool(self._dz_max_width_var.get()) else "fit"))
+                if self._processor.is_running()
+                else None,
+                self._auto_roi_recompute(force=True) if bool(self.roi_auto_var.get()) else self._render_preview_from_last(),
+            ),
+        )
+
         # Debug view selector
         ctk.CTkLabel(frm_roi, text="Road Debug (превью):", anchor="w", text_color="#bbb").grid(
             row=15, column=0, sticky="w", padx=10, pady=(0, 0)
@@ -989,6 +1009,7 @@ class MainWindow(ctk.CTk):
                 use_perspective=bool(self._use_perspective_var.get()),
                 dz_near_bottom_frac=float(self._dz_near_bottom_var.get()) / 100.0,
                 dz_edge_quantile=float(self._dz_edge_q_var.get()) / 100.0,
+                dz_method=("max_width" if bool(self._dz_max_width_var.get()) else "fit"),
             )
             self.lbl_status.configure(text="Статус: воспроизведение…")
         except Exception as e:
