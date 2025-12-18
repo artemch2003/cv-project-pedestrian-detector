@@ -30,6 +30,12 @@ class DetectionConfig:
     max_det: int = 50
     min_area_pct: float = 0.20  # bbox area must be >= X% of frame area to count as "relevant"
     roi: RoiPct = field(default_factory=RoiPct)
+    # danger_zone source:
+    # - "roi": manual rectangle (converted to quad)
+    # - "road": build danger_zone from detected road (drivable area) mask
+    danger_zone_mode: str = "roi"
+    # overlay drivable-area mask on preview/export frames (if available)
+    show_road_mask: bool = False
 
 
 @dataclass(slots=True)

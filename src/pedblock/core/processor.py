@@ -16,6 +16,7 @@ from pedblock.core.config import DetectionConfig, ExportConfig, RoiPct
 from pedblock.core.danger_zone import DangerZonePct, danger_zone_pct_to_px
 from pedblock.core.events import EventRecorder, ObstructionSpan, spans_to_jsonable
 from pedblock.core.roi import roi_pct_to_px
+from pedblock.core.road_area import RoadAreaParams, danger_zone_pct_from_road_mask, estimate_road_mask
 from pedblock.core.types import Box, FrameInfo
 from pedblock.core.video_io import make_writer, open_video, probe_video
 from pedblock.core.yolo_ultralytics import YoloUltralyticsDetector
@@ -63,6 +64,9 @@ class VideoProcessor:
         self._speed = 1.0
         self._roi_pct = RoiPct()
         self._danger_zone_pct: DangerZonePct | None = None
+        self._danger_zone_manual_override = False
+        self._danger_zone_mode = "roi"
+        self._show_road_mask = False
 
     def start(self, video_path: str, det_cfg: DetectionConfig, exp_cfg: ExportConfig) -> None:
         with self._running_lock:
@@ -103,6 +107,12 @@ class VideoProcessor:
         # send as a tuple to keep control channel simple/pickle-free
         roi = RoiPct(x=float(roi.x), y=float(roi.y), w=float(roi.w), h=float(roi.h)).clamp()
         self._enqueue_ctrl(_ControlCmd(kind="roi", value=(roi.x, roi.y, roi.w, roi.h)))
+
+    def set_danger_zone_mode(self, mode: str) -> None:
+        self._enqueue_ctrl(_ControlCmd(kind="danger_zone_mode", value=str(mode or "roi")))
+
+    def set_show_road_mask(self, enabled: bool) -> None:
+        self._enqueue_ctrl(_ControlCmd(kind="show_road_mask", value=bool(enabled)))
 
     def set_danger_zone_pct(self, dz: DangerZonePct) -> None:
         dz = DangerZonePct(points=[(float(x), float(y)) for (x, y) in dz.points]).clamp()
@@ -180,6 +190,7 @@ class VideoProcessor:
                         self._roi_pct.x,
                         self._roi_pct.y + self._roi_pct.h,
                     ).clamp()
+                    self._danger_zone_manual_override = False
                 except Exception:
                     # ignore malformed roi commands
                     pass
@@ -190,6 +201,34 @@ class VideoProcessor:
                     for i in range(0, len(flat) - 1, 2):
                         pts.append((float(flat[i]), float(flat[i + 1])))
                     self._danger_zone_pct = DangerZonePct(points=pts).clamp()
+                    self._danger_zone_manual_override = True
+                except Exception:
+                    pass
+            elif cmd.kind == "danger_zone_mode":
+                try:
+                    m = str(cmd.value or "roi").strip().lower()
+                    if m not in ("roi", "road"):
+                        m = "roi"
+                    self._danger_zone_mode = m
+                    # Switching mode should clear manual override (user intent is mode-driven).
+                    self._danger_zone_manual_override = False
+                    if m == "roi":
+                        # ensure ROI->quad is the active zone baseline
+                        self._danger_zone_pct = DangerZonePct.from_quad(
+                            self._roi_pct.x,
+                            self._roi_pct.y,
+                            self._roi_pct.x + self._roi_pct.w,
+                            self._roi_pct.y,
+                            self._roi_pct.x + self._roi_pct.w,
+                            self._roi_pct.y + self._roi_pct.h,
+                            self._roi_pct.x,
+                            self._roi_pct.y + self._roi_pct.h,
+                        ).clamp()
+                except Exception:
+                    pass
+            elif cmd.kind == "show_road_mask":
+                try:
+                    self._show_road_mask = bool(cmd.value)
                 except Exception:
                     pass
 
@@ -233,6 +272,7 @@ class VideoProcessor:
 
         frame_index = -1
         last_progress_emit = 0.0
+        last_used_dz_pct: DangerZonePct | None = None
 
         # initialize mutable runtime ROI from config
         self._roi_pct = RoiPct(
@@ -251,6 +291,16 @@ class VideoProcessor:
             self._roi_pct.x,
             self._roi_pct.y + self._roi_pct.h,
         ).clamp()
+        self._danger_zone_manual_override = False
+        self._danger_zone_mode = (det_cfg.danger_zone_mode or "roi").strip().lower()
+        if self._danger_zone_mode not in ("roi", "road"):
+            self._danger_zone_mode = "roi"
+        self._show_road_mask = bool(det_cfg.show_road_mask)
+
+        # road-based danger zone smoothing (best-effort)
+        road_dz_smoothed: DangerZonePct | None = None
+        road_alpha = 0.25
+        road_params = RoadAreaParams()
 
         try:
             while not self._stop_event.is_set():
@@ -266,9 +316,35 @@ class VideoProcessor:
                 frame_index += 1
 
                 h, w = frame.shape[:2]
-                dz_pct = self._danger_zone_pct
+                road_mask_u8: np.ndarray | None = None
+                dz_pct: DangerZonePct | None = None
+
+                # 1) choose danger zone source
+                mode = (self._danger_zone_mode or "roi").strip().lower()
+                if mode == "road" and not self._danger_zone_manual_override:
+                    # detect drivable area mask and derive danger zone from it
+                    rm = estimate_road_mask(frame, road_params)
+                    road_mask_u8 = rm.mask_u8
+                    est = danger_zone_pct_from_road_mask(road_mask_u8)
+                    if est is not None:
+                        prev = road_dz_smoothed
+                        if prev is None:
+                            road_dz_smoothed = est
+                        else:
+                            n = min(len(prev.points), len(est.points))
+                            pts: list[tuple[float, float]] = []
+                            for i in range(n):
+                                px, py = prev.points[i]
+                                ex, ey = est.points[i]
+                                pts.append(((1 - road_alpha) * px + road_alpha * ex, (1 - road_alpha) * py + road_alpha * ey))
+                            road_dz_smoothed = DangerZonePct(points=pts).clamp()
+                        dz_pct = road_dz_smoothed
+
+                # 2) fallback / manual ROI-based zone
                 if dz_pct is None:
-                    roi = roi_pct_to_px(self._roi_pct.x, self._roi_pct.y, self._roi_pct.w, self._roi_pct.h, w, h)
+                    dz_pct = self._danger_zone_pct
+                if dz_pct is None:
+                    _ = roi_pct_to_px(self._roi_pct.x, self._roi_pct.y, self._roi_pct.w, self._roi_pct.h, w, h)
                     dz_pct = DangerZonePct.from_quad(
                         self._roi_pct.x,
                         self._roi_pct.y,
@@ -279,6 +355,8 @@ class VideoProcessor:
                         self._roi_pct.x,
                         self._roi_pct.y + self._roi_pct.h,
                     ).clamp()
+
+                last_used_dz_pct = dz_pct
                 dz = danger_zone_pct_to_px(dz_pct, w, h)
 
                 persons = [b.clamp(w, h) for b in det.detect_persons(frame)]
@@ -295,7 +373,13 @@ class VideoProcessor:
 
                 spans.extend(recorder.update(frame_index, obstructing))
 
-                annotated = draw_annotations(frame, dz, persons, obstructing)
+                annotated = draw_annotations(
+                    frame,
+                    dz,
+                    persons,
+                    obstructing,
+                    road_mask_u8 if bool(self._show_road_mask) else None,
+                )
                 if writer is not None:
                     writer.write(annotated)
 
@@ -340,11 +424,13 @@ class VideoProcessor:
                     "roi_pct": {"x": self._roi_pct.x, "y": self._roi_pct.y, "w": self._roi_pct.w, "h": self._roi_pct.h},
                     "danger_zone_pct": (
                         None
-                        if self._danger_zone_pct is None
+                        if last_used_dz_pct is None
                         else {
-                            "points": [{"x": float(x), "y": float(y)} for (x, y) in self._danger_zone_pct.points],
+                            "points": [{"x": float(x), "y": float(y)} for (x, y) in last_used_dz_pct.points],
                         }
                     ),
+                    "danger_zone_mode": (self._danger_zone_mode or (det_cfg.danger_zone_mode or "roi")),
+                    "show_road_mask": bool(self._show_road_mask),
                     "min_area_pct": det_cfg.min_area_pct,
                     "model_name": det_cfg.model_name,
                     "device": det_cfg.device,

@@ -14,8 +14,26 @@ def draw_annotations(
     roi: DangerZonePx,
     boxes: Iterable[Box],
     obstructing: bool,
+    road_mask_u8: np.ndarray | None = None,
+    *,
+    road_alpha: float = 0.25,
 ) -> np.ndarray:
     out = bgr.copy()
+
+    # Road mask overlay (optional)
+    if road_mask_u8 is not None and getattr(road_mask_u8, "size", 0) != 0:
+        try:
+            a = float(max(0.0, min(0.9, road_alpha)))
+            if a > 0:
+                mask = (road_mask_u8 > 0).astype(np.uint8)
+                if mask.shape[:2] == out.shape[:2]:
+                    overlay = out.copy()
+                    # blue-ish fill
+                    overlay[mask > 0] = (180, 80, 0)
+                    out = cv2.addWeighted(overlay, a, out, 1.0 - a, 0.0)
+        except Exception:
+            # never fail annotation due to overlay
+            pass
 
     # ROI
     cv2.polylines(out, [np.array(roi.as_int32_polyline, dtype=np.int32)], isClosed=True, color=(255, 200, 0), thickness=2)

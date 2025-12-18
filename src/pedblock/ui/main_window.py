@@ -13,6 +13,7 @@ from pedblock import __version__ as app_version
 from pedblock.core.config import DetectionConfig, ExportConfig, RoiPct
 from pedblock.core.auto_roi import estimate_danger_zone_pct
 from pedblock.core.danger_zone import DangerZonePct, danger_zone_pct_to_px
+from pedblock.core.road_area import danger_zone_pct_from_road_mask, estimate_road_mask
 from pedblock.core.processor import FrameResult, ProcessorProgress, VideoProcessor
 from pedblock.core.annotate import draw_annotations
 
@@ -35,6 +36,7 @@ class MainWindow(ctk.CTk):
         self._auto_roi_last_frame_index: int | None = None
         self._auto_roi_smoothed: DangerZonePct | None = None
         self._auto_roi_every_n_frames_var = tk.IntVar(value=5)
+        self._auto_road_mask_u8: np.ndarray | None = None
 
         self._build_ui()
         self._tick()
@@ -104,7 +106,14 @@ class MainWindow(ctk.CTk):
             if last_idx is not None and (fr.frame_info.frame_index - last_idx) < every_n:
                 return
 
-        est = estimate_danger_zone_pct(fr.frame_bgr)
+        # 1) Road mask -> danger zone from drivable area (preferred)
+        rm = estimate_road_mask(fr.frame_bgr)
+        self._auto_road_mask_u8 = rm.mask_u8
+        est = danger_zone_pct_from_road_mask(rm.mask_u8)
+        # 2) Fallback: old line-based trapezoid (still helpful if mask failed)
+        if est is None:
+            est = estimate_danger_zone_pct(fr.frame_bgr)
+
         # Smooth to avoid flicker on noisy lines
         alpha = 0.30
         prev = self._auto_roi_smoothed
@@ -122,7 +131,8 @@ class MainWindow(ctk.CTk):
 
         self._auto_roi_smoothed = sm
         self._auto_roi_last_frame_index = fr.frame_info.frame_index
-        # apply to processor as a rectangle fallback (old API), but render/preview uses quad
+        # Если процессор уже запущен, подстрахуемся и явно отправим полигон:
+        # это позволяет включать авто-режим без перезапуска обработки.
         if self._processor.is_running():
             self._processor.set_danger_zone_pct(sm)
         self._render_preview_from_last()
@@ -130,10 +140,13 @@ class MainWindow(ctk.CTk):
     def _on_auto_roi_toggle(self) -> None:
         enabled = bool(self.roi_auto_var.get())
         self._set_roi_controls_enabled(not enabled)
+        if self._processor.is_running():
+            self._processor.set_danger_zone_mode("road" if enabled else "roi")
         if enabled:
             # reset smoothing to quickly lock onto the scene
             self._auto_roi_smoothed = None
             self._auto_roi_last_frame_index = None
+            self._auto_road_mask_u8 = None
             self._auto_roi_recompute(force=True)
 
     def _update_roi_value_labels(self) -> None:
@@ -181,7 +194,17 @@ class MainWindow(ctk.CTk):
                 obstructing = True
                 break
 
-        annotated = draw_annotations(fr.frame_bgr, dz_px, fr.persons, obstructing)
+        road_mask = None
+        if bool(getattr(self, "show_road_mask_var", tk.BooleanVar(value=False)).get()):
+            # Prefer the cached mask from last auto recompute. If отсутствует — посчитаем по кадру.
+            road_mask = self._auto_road_mask_u8
+            if road_mask is None or getattr(road_mask, "size", 0) == 0:
+                try:
+                    road_mask = estimate_road_mask(fr.frame_bgr).mask_u8
+                except Exception:
+                    road_mask = None
+
+        annotated = draw_annotations(fr.frame_bgr, dz_px, fr.persons, obstructing, road_mask)
         self._set_preview_bgr(annotated)
 
     def _on_roi_change(self) -> None:
@@ -329,7 +352,7 @@ class MainWindow(ctk.CTk):
         self.roi_auto_var = tk.BooleanVar(value=False)
         self.chk_auto_roi = ctk.CTkCheckBox(
             frm_roi,
-            text="Авто danger_zone (по границам дороги)",
+            text="Авто danger_zone (по проезжей части)",
             variable=self.roi_auto_var,
             command=self._on_auto_roi_toggle,
         )
@@ -337,6 +360,15 @@ class MainWindow(ctk.CTk):
 
         self.btn_roi_recalc = ctk.CTkButton(frm_roi, text="Пересчитать по кадру", command=lambda: self._auto_roi_recompute(force=True))
         self.btn_roi_recalc.grid(row=9, column=1, sticky="e", padx=(0, 10), pady=(0, 6))
+
+        # Show road mask overlay
+        self.show_road_mask_var = tk.BooleanVar(value=False)
+        self.chk_show_road = ctk.CTkCheckBox(frm_roi, text="Показывать маску проезжей части", variable=self.show_road_mask_var)
+        self.chk_show_road.grid(row=12, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
+        self.show_road_mask_var.trace_add(
+            "write",
+            lambda *_: self._processor.set_show_road_mask(bool(self.show_road_mask_var.get())) if self._processor.is_running() else None,
+        )
 
         # Auto-ROI frequency (frames)
         ctk.CTkLabel(frm_roi, text="Авто-обновление (кадров):", anchor="w", text_color="#bbb").grid(
@@ -486,6 +518,8 @@ class MainWindow(ctk.CTk):
             conf=float(self.conf_var.get()),
             min_area_pct=float(self.min_area_var.get()),
             roi=roi,
+            danger_zone_mode=("road" if bool(self.roi_auto_var.get()) else "roi"),
+            show_road_mask=bool(getattr(self, "show_road_mask_var", tk.BooleanVar(value=False)).get()),
         )
         exp_cfg = ExportConfig(
             export_video=bool(self.export_video_var.get()),
