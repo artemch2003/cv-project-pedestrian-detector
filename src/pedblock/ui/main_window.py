@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -47,8 +48,86 @@ class MainWindow(ctk.CTk):
         self._dz_near_bottom_var = tk.DoubleVar(value=35.0)  # %
         self._dz_edge_q_var = tk.DoubleVar(value=6.0)  # %
 
+        # Preview cache: allows "повторный просмотр" без пересчёта маски/авто danger_zone.
+        # Храним только последние N кадров (LRU), иначе память улетит на длинных видео.
+        self._preview_cache_key: tuple[object, ...] | None = None
+        self._road_mask_cache_lru: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self._auto_dz_cache_lru: "OrderedDict[int, DangerZonePct]" = OrderedDict()
+        self._preview_cache_max_items: int = 80
+
         self._build_ui()
         self._tick()
+
+    def _get_preview_cache_key(self) -> tuple[object, ...] | None:
+        # Cache is only meaningful when a video is selected.
+        if not self._video_path:
+            return None
+        rp = self._get_road_params()
+        calib_mtime = None
+        try:
+            if bool(rp.use_perspective) and rp.calib_path and os.path.exists(rp.calib_path):
+                calib_mtime = float(os.path.getmtime(rp.calib_path))
+        except Exception:
+            calib_mtime = None
+        # Include road params that affect mask/zone; if they change, cache must be invalidated.
+        return (
+            str(self._video_path),
+            float(rp.color_dist_thresh),
+            bool(rp.use_perspective),
+            float(rp.dz_near_bottom_frac),
+            float(rp.dz_edge_quantile),
+            calib_mtime,
+        )
+
+    def _ensure_preview_cache(self) -> None:
+        key = self._get_preview_cache_key()
+        if key != self._preview_cache_key:
+            self._preview_cache_key = key
+            self._road_mask_cache_lru.clear()
+            self._auto_dz_cache_lru.clear()
+
+    def _lru_get_mask(self, frame_index: int) -> np.ndarray | None:
+        try:
+            m = self._road_mask_cache_lru.get(int(frame_index))
+        except Exception:
+            return None
+        if m is not None:
+            try:
+                self._road_mask_cache_lru.move_to_end(int(frame_index))
+            except Exception:
+                pass
+        return m
+
+    def _lru_put_mask(self, frame_index: int, mask_u8: np.ndarray) -> None:
+        try:
+            self._road_mask_cache_lru[int(frame_index)] = mask_u8
+            self._road_mask_cache_lru.move_to_end(int(frame_index))
+            while len(self._road_mask_cache_lru) > int(self._preview_cache_max_items):
+                self._road_mask_cache_lru.popitem(last=False)
+        except Exception:
+            # cache is best-effort; never break preview
+            pass
+
+    def _lru_get_auto_dz(self, frame_index: int) -> DangerZonePct | None:
+        try:
+            dz = self._auto_dz_cache_lru.get(int(frame_index))
+        except Exception:
+            return None
+        if dz is not None:
+            try:
+                self._auto_dz_cache_lru.move_to_end(int(frame_index))
+            except Exception:
+                pass
+        return dz
+
+    def _lru_put_auto_dz(self, frame_index: int, dz: DangerZonePct) -> None:
+        try:
+            self._auto_dz_cache_lru[int(frame_index)] = dz
+            self._auto_dz_cache_lru.move_to_end(int(frame_index))
+            while len(self._auto_dz_cache_lru) > int(self._preview_cache_max_items):
+                self._auto_dz_cache_lru.popitem(last=False)
+        except Exception:
+            pass
 
     def _set_preview_bgr(self, bgr, *, target: str = "main") -> None:
         lbl = self.preview_main if target == "main" else self.preview_mask
@@ -291,6 +370,20 @@ class MainWindow(ctk.CTk):
         fr = self._last_frame
         if fr is None:
             return
+        self._ensure_preview_cache()
+
+        # Fast path: if we already computed auto-zone for this frame_index earlier,
+        # reuse it (even if throttle would normally skip) — this is the "повторный просмотр из кэша".
+        cached = self._lru_get_auto_dz(fr.frame_info.frame_index)
+        if cached is not None and not force:
+            self._auto_roi_smoothed = cached
+            self._auto_roi_last_frame_index = fr.frame_info.frame_index
+            # also refresh cached road mask for overlay/debug if available
+            cm = self._lru_get_mask(fr.frame_info.frame_index)
+            if cm is not None:
+                self._auto_road_mask_u8 = cm
+            self._render_preview_from_last()
+            return
 
         # Throttle updates to avoid visible jitter
         if not force:
@@ -310,6 +403,9 @@ class MainWindow(ctk.CTk):
             rm = estimate_road_mask(fr.frame_bgr, rp)
             self._auto_road_mask_u8 = rm.mask_u8
             self._auto_road_debug = None
+
+        if self._auto_road_mask_u8 is not None and getattr(self._auto_road_mask_u8, "size", 0) != 0:
+            self._lru_put_mask(fr.frame_info.frame_index, self._auto_road_mask_u8)
 
         est = danger_zone_pct_from_road_mask(self._auto_road_mask_u8, self._get_road_params())
         # 2) Fallback: old line-based trapezoid (still helpful if mask failed)
@@ -333,6 +429,7 @@ class MainWindow(ctk.CTk):
 
         self._auto_roi_smoothed = sm
         self._auto_roi_last_frame_index = fr.frame_info.frame_index
+        self._lru_put_auto_dz(fr.frame_info.frame_index, sm)
         # Важно: не отправляем полигон как "ручной override" в процессор, иначе он перестанет
         # строить danger_zone по маске дороги (mode="road") и маска может не попадать в экспорт/оверлей.
         # Переключение режима делается в _on_auto_roi_toggle(), этого достаточно.
@@ -366,6 +463,7 @@ class MainWindow(ctk.CTk):
         fr = self._last_frame
         if fr is None:
             return
+        self._ensure_preview_cache()
         w = int(fr.frame_info.width)
         h = int(fr.frame_info.height)
         if bool(getattr(self, "roi_auto_var", tk.BooleanVar(value=False)).get()) and self._auto_roi_smoothed is not None:
@@ -430,11 +528,14 @@ class MainWindow(ctk.CTk):
 
         road_mask = None
         if bool(getattr(self, "show_road_mask_var", tk.BooleanVar(value=False)).get()):
-            # Prefer the cached mask from last auto recompute. If отсутствует — посчитаем по кадру.
-            road_mask = self._auto_road_mask_u8
+            # Prefer cached mask for this frame index (repeat playback), then last auto recompute.
+            cached_mask = self._lru_get_mask(fr.frame_info.frame_index)
+            road_mask = cached_mask if cached_mask is not None else self._auto_road_mask_u8
             if road_mask is None or getattr(road_mask, "size", 0) == 0:
                 try:
                     road_mask = estimate_road_mask(fr.frame_bgr, self._get_road_params()).mask_u8
+                    if road_mask is not None and getattr(road_mask, "size", 0) != 0:
+                        self._lru_put_mask(fr.frame_info.frame_index, road_mask)
                 except Exception:
                     road_mask = None
 
@@ -814,6 +915,10 @@ class MainWindow(ctk.CTk):
         if not path:
             return
         self._video_path = path
+        # new video -> drop preview caches
+        self._preview_cache_key = None
+        self._road_mask_cache_lru.clear()
+        self._auto_dz_cache_lru.clear()
         self.lbl_video.configure(text=f"Видео: {path}")
         self.lbl_status.configure(text="Статус: видео выбрано, можно стартовать")
         self.progress.set(0.0)
@@ -864,6 +969,16 @@ class MainWindow(ctk.CTk):
         )
 
         try:
+            # Если видео запускается повторно, frame_index снова пойдёт с 0.
+            # В этом случае старый _auto_roi_last_frame_index (из прошлого прогона) ломает throttle
+            # в _auto_roi_recompute(): (0 - last_idx) < every_n => авто-ROI/маска никогда не пересчитаются,
+            # а оверлеи остаются статичными. Сбросим кэши заранее.
+            if bool(getattr(self, "roi_auto_var", tk.BooleanVar(value=False)).get()):
+                self._auto_roi_smoothed = None
+                self._auto_roi_last_frame_index = None
+                self._auto_road_mask_u8 = None
+                self._auto_road_debug = None
+
             self._processor.start(self._video_path, det_cfg, exp_cfg)
             self._paused = False
             self.btn_pause.configure(text="Пауза")
@@ -930,7 +1045,18 @@ class MainWindow(ctk.CTk):
     def _apply_frame(self, fr: FrameResult) -> None:
         self._last_frame = fr
         if bool(self.roi_auto_var.get()):
-            self._auto_roi_recompute(force=False)
+            # Если воспроизведение стартует заново (frame_index сбросился),
+            # сбрасываем throttle/caches, иначе авто-маска и авто danger_zone "залипают"
+            # на результатах предыдущего прогона.
+            last_idx = self._auto_roi_last_frame_index
+            if last_idx is not None and fr.frame_info.frame_index < last_idx:
+                self._auto_roi_smoothed = None
+                self._auto_roi_last_frame_index = None
+                self._auto_road_mask_u8 = None
+                self._auto_road_debug = None
+                self._auto_roi_recompute(force=True)
+            else:
+                self._auto_roi_recompute(force=False)
         self._render_preview_from_last()
 
 
