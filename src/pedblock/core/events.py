@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+__all__ = [
+    "ObstructionSpan",
+    "EventRecorder",
+    "spans_to_jsonable",
+]
+
 
 @dataclass(frozen=True, slots=True)
 class ObstructionSpan:

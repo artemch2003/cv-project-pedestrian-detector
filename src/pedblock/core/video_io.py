@@ -4,6 +4,13 @@ from dataclasses import dataclass
 
 import cv2
 
+__all__ = [
+    "VideoMeta",
+    "probe_video",
+    "open_video",
+    "make_writer",
+]
+
 
 @dataclass(frozen=True, slots=True)
 class VideoMeta:

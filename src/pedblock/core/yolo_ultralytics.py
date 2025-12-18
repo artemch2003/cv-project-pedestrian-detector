@@ -9,6 +9,10 @@ from pedblock.core.config import DetectionConfig
 from pedblock.core.detector import Detector
 from pedblock.core.types import Box
 
+__all__ = [
+    "YoloUltralyticsDetector",
+]
+
 
 def _normalize_device(device: str) -> str:
     d = (device or "").strip().lower()

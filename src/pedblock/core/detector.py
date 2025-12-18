@@ -6,6 +6,10 @@ import numpy as np
 
 from pedblock.core.types import Box
 
+__all__ = [
+    "Detector",
+]
+
 
 class Detector(ABC):
     @abstractmethod

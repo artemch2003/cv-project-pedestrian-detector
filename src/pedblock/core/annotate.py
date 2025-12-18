@@ -8,6 +8,10 @@ import numpy as np
 from pedblock.core.danger_zone import DangerZonePx
 from pedblock.core.types import Box
 
+__all__ = [
+    "draw_annotations",
+]
+
 
 def draw_annotations(
     bgr: np.ndarray,

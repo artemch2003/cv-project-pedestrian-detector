@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+__all__ = [
+    "RoiPx",
+    "roi_pct_to_px",
+]
+
 
 @dataclass(frozen=True, slots=True)
 class RoiPx:

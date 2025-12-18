@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+__all__ = [
+    "FrameInfo",
+    "Box",
+]
+
 
 @dataclass(frozen=True, slots=True)
 class FrameInfo:
+    """Метаданные кадра (индекс/размер/FPS)."""
+
     frame_index: int
     fps: float
     width: int
@@ -19,6 +26,8 @@ class FrameInfo:
 
 @dataclass(frozen=True, slots=True)
 class Box:
+    """BBox детекции (xyxy + confidence)."""
+
     x1: float
     y1: float
     x2: float
@@ -26,6 +35,7 @@ class Box:
     conf: float
 
     def clamp(self, w: int, h: int) -> "Box":
+        """Ограничивает координаты bbox границами кадра и нормализует порядок (x1<=x2, y1<=y2)."""
         x1 = max(0.0, min(float(w - 1), self.x1))
         x2 = max(0.0, min(float(w - 1), self.x2))
         y1 = max(0.0, min(float(h - 1), self.y1))
