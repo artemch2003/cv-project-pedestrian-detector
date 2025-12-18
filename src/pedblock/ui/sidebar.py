@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+"""
+`sidebar.py` — левая панель управления (настройки + кнопки).
+
+Цели модуля:
+- держать код сборки UI компактным и изолированным от `main_window.py`
+- создавать виджеты и привязывать их к переменным/колбэкам окна
+
+Почему `app: object`:
+- чтобы компонент можно было переиспользовать и не тянуть циклические импорты
+- фактически ожидается `MainWindow`, поэтому доступ к атрибутам помечен `type: ignore`
+"""
+
 import tkinter as tk
 
 import customtkinter as ctk
@@ -45,6 +57,7 @@ def build_sidebar(app: object) -> None:
     left.grid_columnconfigure(0, weight=1)
 
     # ---- Video ----
+    # Кнопка выбора видео + label с путём к файлу.
     app.btn_open = ctk.CTkButton(left, text="Открыть видео…", command=app._on_open_video)  # type: ignore[attr-defined]
     app.btn_open.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
 
@@ -52,6 +65,7 @@ def build_sidebar(app: object) -> None:
     app.lbl_video.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
 
     # ---- Model / device ----
+    # Настройки инференса: путь/имя модели и устройство (auto/cpu/mps/cuda).
     frm_md = ctk.CTkFrame(left)
     frm_md.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
     frm_md.grid_columnconfigure(0, weight=1)
@@ -70,6 +84,7 @@ def build_sidebar(app: object) -> None:
     app.device_menu.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
 
     # ---- Thresholds ----
+    # Порог confidence и фильтрация «мелких» bbox по площади в % кадра.
     frm_thr = ctk.CTkFrame(left)
     frm_thr.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 12))
     frm_thr.grid_columnconfigure(0, weight=1)
@@ -89,6 +104,7 @@ def build_sidebar(app: object) -> None:
     app.min_area_lbl.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 10))
 
     # ---- ROI ----
+    # ROI задаёт область интереса / «опасную зону» (danger_zone) в процентах кадра.
     frm_roi = ctk.CTkFrame(left)
     frm_roi.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 12))
     frm_roi.grid_columnconfigure(0, weight=1)
@@ -118,12 +134,15 @@ def build_sidebar(app: object) -> None:
     app.btn_roi_recalc.grid(row=9, column=1, sticky="e", padx=(0, 10), pady=(0, 6))
 
     # Show road mask overlay
+    # Переключатель отображения маски дороги на превью (оверлей + отдельная панель).
     app.show_road_mask_var = tk.BooleanVar(value=False)  # type: ignore[attr-defined]
     app.chk_show_road = ctk.CTkCheckBox(frm_roi, text="Показывать маску проезжей части", variable=app.show_road_mask_var)  # type: ignore[attr-defined]
     app.chk_show_road.grid(row=12, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
     app.show_road_mask_var.trace_add("write", lambda *_: app._on_show_road_mask_changed())  # type: ignore[attr-defined]
 
     # Road segmentation strictness (color threshold)
+    # Основной параметр сегментации дороги: допустимая «дистанция по цвету».
+    # Меньше => строже => меньше ложноположительных «дорог».
     ctk.CTkLabel(frm_roi, text="Строгость маски (цвет, меньше = строже):", anchor="w", text_color="#bbb").grid(
         row=13, column=0, sticky="w", padx=10, pady=(0, 0)
     )
@@ -150,6 +169,8 @@ def build_sidebar(app: object) -> None:
     app._road_debug_menu.grid(row=16, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
 
     # OpenADAS-style perspective mode (bird-view calibration)
+    # Перспективное преобразование: из 4 точек на изображении строится bird-view,
+    # что может стабилизировать сегментацию дороги (особенно на наклонных камерах).
     app.chk_perspective = ctk.CTkCheckBox(  # type: ignore[attr-defined]
         frm_roi,
         text="Перспектива (OpenADAS): bird-view калибровка",
@@ -161,6 +182,7 @@ def build_sidebar(app: object) -> None:
     app.btn_calib.grid(row=18, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
 
     # Danger-zone tuning from road mask
+    # Тюнинг вычисления трапеции danger_zone по маске дороги.
     ctk.CTkLabel(frm_roi, text="Высота danger_zone от низа (%):", anchor="w", text_color="#bbb").grid(row=19, column=0, sticky="w", padx=10, pady=(0, 0))
     app._dz_near_bottom_lbl = ctk.CTkLabel(frm_roi, text="35", anchor="e", text_color="#bbb")  # type: ignore[attr-defined]
     app._dz_near_bottom_lbl.grid(row=19, column=1, sticky="e", padx=(0, 10), pady=(0, 0))
@@ -192,6 +214,7 @@ def build_sidebar(app: object) -> None:
     app._dz_hough_sides_var.trace_add("write", lambda *_: app._on_dz_method_changed())  # type: ignore[attr-defined]
 
     # Auto-ROI frequency (frames)
+    # Частота пересчёта авто ROI: влияет на стабильность/нагрузку.
     ctk.CTkLabel(frm_roi, text="Авто-обновление (кадров):", anchor="w", text_color="#bbb").grid(row=10, column=0, sticky="w", padx=10, pady=(0, 0))
     app._auto_roi_every_n_lbl = ctk.CTkLabel(frm_roi, text="5", anchor="e", text_color="#bbb")  # type: ignore[attr-defined]
     app._auto_roi_every_n_lbl.grid(row=10, column=1, sticky="e", padx=(0, 10), pady=(0, 0))
@@ -224,6 +247,7 @@ def build_sidebar(app: object) -> None:
     app.lbl_outdir.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
 
     # ---- Run controls ----
+    # Управление запуском/пауза/стоп.
     frm_play = ctk.CTkFrame(left)
     frm_play.grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 8))
     frm_play.grid_columnconfigure(0, weight=1)
@@ -248,6 +272,7 @@ def build_sidebar(app: object) -> None:
     app.lbl_status.grid(row=11, column=0, sticky="ew", padx=12, pady=(0, 12))
 
     # ---- Bind updates for labels / realtime controls (moved from main_window.py) ----
+    # Trace'ы обновляют подписи рядом со слайдерами/переключателями без ручного refresh.
     app.conf_var.trace_add("write", lambda *_: app.conf_lbl.configure(text=f"{app.conf_var.get():.2f}"))  # type: ignore[attr-defined]
     app.min_area_var.trace_add("write", lambda *_: app.min_area_lbl.configure(text=f"{app.min_area_var.get():.2f}%"))  # type: ignore[attr-defined]
     app._auto_roi_every_n_frames_var.trace_add(  # type: ignore[attr-defined]
@@ -256,6 +281,7 @@ def build_sidebar(app: object) -> None:
     )
 
     # ROI realtime (values + apply)
+    # Любое движение слайдера вызывает пересчёт ROI и перерисовку превью (и, если запущено, обновляет процессор).
     app.roi_x.trace_add("write", lambda *_: app._on_roi_change())  # type: ignore[attr-defined]
     app.roi_y.trace_add("write", lambda *_: app._on_roi_change())  # type: ignore[attr-defined]
     app.roi_w.trace_add("write", lambda *_: app._on_roi_change())  # type: ignore[attr-defined]

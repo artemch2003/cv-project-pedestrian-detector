@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+"""
+`perspective_calib_dialog.py` — диалог калибровки перспективы (bird-view) в стиле OpenADAS.
+
+Пользователь кликает 4 точки на кадре (углы трапеции на дороге), вводит метрики (L1/L2/W1/W2)
+и px/м — после чего калибровка сохраняется в JSON.
+
+Этот файл специально вынесен из `main_window.py`, чтобы:
+- не раздувать класс главного окна
+- локализовать UI-логику калибровки и рисования точек на Canvas
+"""
+
 from typing import Callable
 import tkinter as tk
 from tkinter import messagebox
@@ -29,10 +40,12 @@ def open_perspective_calib_dialog(
         messagebox.showinfo("Калибровка", "Нет кадра для калибровки.")
         return
 
-    # Copy frame to avoid accidental mutation
+    # Копируем кадр, чтобы случайно не мутировать внешний буфер
+    # (особенно важно, если кадр переиспользуется в превью/кэше).
     frame_bgr = frame_bgr.copy()
     h, w = frame_bgr.shape[:2]
 
+    # Toplevel-окно: модальный диалог поверх основного окна.
     top = ctk.CTkToplevel(parent)
     top.title("Калибровка перспективы (OpenADAS)")
     top.geometry("980x720")
@@ -68,10 +81,13 @@ def open_perspective_calib_dialog(
     ctk.CTkLabel(top, text=f"Файл: {calib_path}", anchor="w", text_color="#bbb").pack(padx=14, pady=(0, 8), fill="x")
 
     # Canvas preview
+    # На Canvas рисуем "скрин" кадра (вписанный в фиксированный размер) и поверх — точки/контур.
     canvas = tk.Canvas(top, bg="black", width=940, height=520, highlightthickness=0)
     canvas.pack(padx=14, pady=(0, 10), fill="both", expand=True)
 
     # Fit frame into canvas
+    # Важно: мы НЕ растягиваем изображение до бесконечности, а выбираем scale так,
+    # чтобы кадр влез целиком в область канваса, сохраняя aspect ratio.
     max_w, max_h = 940, 520
     scale = min(max_w / max(1, w), max_h / max(1, h))
     disp_w = int(round(w * scale))
@@ -83,12 +99,14 @@ def open_perspective_calib_dialog(
     imgtk_holder: dict[str, ImageTk.PhotoImage] = {}
 
     def _render() -> None:
+        """Перерисовывает Canvas: фон-кадр + текущие точки + (если 4 точки) замкнутый полигон."""
         img = pil_base.copy()
         # draw points and poly
         arr = np.array(img)
         # point markers
         labels = ["P1", "P2", "P3", "P4"]
         ordered: list[tuple[float, float]] | None = None
+        # Если точек 4, пытаемся упорядочить их как TL/TR/BR/BL (как в OpenADAS).
         if len(points) == 4:
             try:
                 ordered = order_quad_tl_tr_br_bl(points)
@@ -112,6 +130,7 @@ def open_perspective_calib_dialog(
         canvas.create_image(0, 0, image=imgtk, anchor="nw")
 
     def _on_click(ev) -> None:
+        """Обработчик клика по Canvas: добавляет точку (в координатах исходного кадра)."""
         nonlocal points
         if len(points) >= 4:
             return
@@ -119,6 +138,7 @@ def open_perspective_calib_dialog(
         y_disp = float(ev.y)
         if x_disp < 0 or y_disp < 0 or x_disp >= disp_w or y_disp >= disp_h:
             return
+        # Координаты мыши в display-пространстве переводим обратно в исходный кадр.
         x_orig = x_disp / scale
         y_orig = y_disp / scale
         points.append((float(x_orig), float(y_orig)))
@@ -127,6 +147,8 @@ def open_perspective_calib_dialog(
     canvas.bind("<Button-1>", _on_click)
 
     # preload points from existing calib (if any)
+    # Если ранее уже была калибровка — подставляем точки по умолчанию,
+    # чтобы пользователь мог подправить их, а не кликать заново.
     if existing is not None:
         try:
             points = [(float(x), float(y)) for (x, y) in existing.image_points_px]
@@ -141,11 +163,13 @@ def open_perspective_calib_dialog(
     frm_btn.grid_columnconfigure(2, weight=1)
 
     def _reset() -> None:
+        """Сбрасывает выбранные точки."""
         nonlocal points
         points = []
         _render()
 
     def _save() -> None:
+        """Валидирует ввод, сохраняет калибровку в файл и включает перспективный режим."""
         try:
             if len(points) != 4:
                 raise ValueError("Нужно выбрать 4 точки")
@@ -164,6 +188,7 @@ def open_perspective_calib_dialog(
             return
 
         # Enable perspective mode immediately
+        # Включаем режим сразу, чтобы пользователь увидел эффект без дополнительных кликов.
         use_perspective_var.set(True)
         on_perspective_toggle()
         messagebox.showinfo("Готово", "Калибровка сохранена. Перспективный режим включён.")

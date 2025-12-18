@@ -1,5 +1,21 @@
 from __future__ import annotations
 
+"""
+`main_window.py` — главное окно приложения (CustomTkinter).
+
+Ответственности `MainWindow`:
+- собрать UI (sidebar + превью)
+- управлять состояниями UI (выбрано видео / идёт обработка / пауза)
+- синхронизировать параметры UI с `pedblock.core.VideoProcessor`
+- принимать результаты обработки (кадры/прогресс) и отрисовывать превью
+
+Дизайн:
+- тяжелая логика детекции/сегментации/экспорта находится в `pedblock.core`
+- UI использует `VideoProcessor` как worker: старт/пауза/стоп + poll результатов
+- превью перерисовывается на основе последнего `FrameResult`, а также использует небольшой LRU-кэш
+  для повторного просмотра без перерасчётов (маска дороги и auto danger_zone)
+"""
+
 from collections import OrderedDict
 import os
 import tkinter as tk
@@ -25,28 +41,49 @@ from pedblock.ui.preview_panel import build_preview_panel
 
 
 class MainWindow(ctk.CTk):
+    """
+    Главное окно приложения.
+
+    Базовый цикл работы:
+    - пользователь выбирает видео и настраивает параметры
+    - `Старт` запускает `VideoProcessor` (внутри — фоновый поток/воркер)
+    - `MainWindow._tick()` периодически забирает события из `processor.poll()`:
+      прогресс и результаты по кадрам, затем обновляет UI.
+
+    Превью:
+    - основной кадр рисуется аннотациями (`draw_annotations`)
+    - опционально отображается маска дороги (оверлей + отдельная панель)
+    - изображения кэшируются в виде BGR-матриц, а при ресайзе окна выполняется пересчёт
+      `CTkImage` (debounce через `_schedule_preview_rescale()`).
+    """
+
     _AUTO_ROI_ALPHA = 0.30
     _AUTO_ROI_EVERY_N_MIN = 1
     _AUTO_ROI_EVERY_N_MAX = 60
 
     def __init__(self) -> None:
+        """Создаёт окно, инициализирует состояние, строит UI и запускает цикл `_tick()`."""
         super().__init__()
         self.title(f"Pedestrian Blocker v{app_version} — YOLO + CustomTkinter")
         self.geometry("1200x780")
         self.minsize(1000, 680)
 
         self._video_path: str | None = None
+        # Worker, выполняющий обработку видео в фоне и отдающий результаты через poll().
         self._processor = VideoProcessor()
-        # For CTkLabel previews use CTkImage (not PIL.ImageTk.PhotoImage), иначе будет warning и проблемы с HiDPI scaling.
+        # Для CTkLabel-превью используем CTkImage (а не PIL.ImageTk.PhotoImage):
+        # иначе будут warning'и и проблемы с HiDPI scaling в CustomTkinter.
         self._preview_ctkimg_main: ctk.CTkImage | None = None
         self._preview_ctkimg_mask: ctk.CTkImage | None = None
-        # Keep last rendered images (BGR) so we can re-fit on window resize without recomputing detection/masks.
+        # Храним последние отрисованные изображения (BGR), чтобы при ресайзе окна
+        # можно было просто «перефитить» картинку без пересчёта детекции/масок.
         self._last_preview_bgr_main: np.ndarray | None = None
         self._last_preview_bgr_mask: np.ndarray | None = None
         self._preview_rescale_after_id: str | None = None
         self._preview_mask_visible: bool = False
         self._preview_right: ctk.CTkFrame | None = None
         self._paused = False
+        # Флаг нужен, чтобы trace'ы TkVar не вызывали рекурсивный пересчёт при программной установке ROI.
         self._roi_internal_update = False
         self._last_frame: FrameResult | None = None
         self._roi_value_labels: dict[str, ctk.CTkLabel] = {}
@@ -75,6 +112,7 @@ class MainWindow(ctk.CTk):
         self._tick()
 
     def _get_dz_method(self) -> str:
+        """Возвращает выбранный метод построения danger_zone по маске дороги."""
         if bool(self._dz_hough_sides_var.get()):
             return "hough"
         if bool(self._dz_max_width_var.get()):
@@ -97,35 +135,46 @@ class MainWindow(ctk.CTk):
             self._render_preview_from_last()
 
     def _on_show_road_mask_changed(self) -> None:
+        """Обработчик чекбокса «Показывать маску…»: переключает runtime-оверлей и перерисовывает превью."""
         if self._processor.is_running():
             self._processor.set_show_road_mask(bool(self.show_road_mask_var.get()))
         # Overlay toggle doesn't require recompute; just redraw.
         self._render_preview_from_last()
 
     def _on_road_color_thresh_changed(self) -> None:
+        """Обработчик слайдера строгости маски (color distance threshold)."""
         self._road_thresh_lbl.configure(text=f"{self._road_color_thresh_var.get():.1f}")
         if self._processor.is_running():
             self._processor.set_road_params(color_dist_thresh=float(self._road_color_thresh_var.get()))
         self._refresh_preview_after_road_param_change(force_auto_roi=True)
 
     def _on_dz_near_bottom_changed(self) -> None:
+        """Обработчик слайдера высоты danger_zone от низа (в % кадра)."""
         self._dz_near_bottom_lbl.configure(text=f"{self._dz_near_bottom_var.get():.0f}")
         if self._processor.is_running():
             self._processor.set_road_params(dz_near_bottom_frac=float(self._dz_near_bottom_var.get()) / 100.0)
         self._refresh_preview_after_road_param_change(force_auto_roi=True)
 
     def _on_dz_edge_q_changed(self) -> None:
+        """Обработчик слайдера отсечения краёв маски (квантили)."""
         self._dz_edge_q_lbl.configure(text=f"{self._dz_edge_q_var.get():.0f}")
         if self._processor.is_running():
             self._processor.set_road_params(dz_edge_quantile=float(self._dz_edge_q_var.get()) / 100.0)
         self._refresh_preview_after_road_param_change(force_auto_roi=True)
 
     def _on_dz_method_changed(self) -> None:
+        """Обработчик смены метода построения зоны (fit/max_width/hough)."""
         if self._processor.is_running():
             self._processor.set_road_params(dz_method=self._get_dz_method())
         self._refresh_preview_after_road_param_change(force_auto_roi=True)
 
     def _get_preview_cache_key(self) -> tuple[object, ...] | None:
+        """
+        Формирует ключ, по которому валидируется кэш превью.
+
+        Идея: если меняются параметры, влияющие на маску/зону (road params, перспектива, mtime калибровки),
+        то старые кэшированные значения использовать нельзя.
+        """
         # Cache is only meaningful when a video is selected.
         if not self._video_path:
             return None
@@ -148,6 +197,7 @@ class MainWindow(ctk.CTk):
         )
 
     def _ensure_preview_cache(self) -> None:
+        """Сбрасывает LRU-кэши маски/auto-ROI, если изменился ключ `_get_preview_cache_key()`."""
         key = self._get_preview_cache_key()
         if key != self._preview_cache_key:
             self._preview_cache_key = key
@@ -155,6 +205,7 @@ class MainWindow(ctk.CTk):
             self._auto_dz_cache_lru.clear()
 
     def _lru_get_mask(self, frame_index: int) -> np.ndarray | None:
+        """Возвращает маску дороги из LRU по frame_index (best-effort)."""
         try:
             m = self._road_mask_cache_lru.get(int(frame_index))
         except Exception:
@@ -167,6 +218,7 @@ class MainWindow(ctk.CTk):
         return m
 
     def _lru_put_mask(self, frame_index: int, mask_u8: np.ndarray) -> None:
+        """Кладёт маску дороги в LRU и обрезает кэш до `_preview_cache_max_items`."""
         try:
             self._road_mask_cache_lru[int(frame_index)] = mask_u8
             self._road_mask_cache_lru.move_to_end(int(frame_index))
@@ -177,6 +229,7 @@ class MainWindow(ctk.CTk):
             pass
 
     def _lru_get_auto_dz(self, frame_index: int) -> DangerZonePct | None:
+        """Возвращает auto danger_zone (в процентах) из LRU по frame_index."""
         try:
             dz = self._auto_dz_cache_lru.get(int(frame_index))
         except Exception:
@@ -189,6 +242,7 @@ class MainWindow(ctk.CTk):
         return dz
 
     def _lru_put_auto_dz(self, frame_index: int, dz: DangerZonePct) -> None:
+        """Кладёт auto danger_zone в LRU и обрезает кэш."""
         try:
             self._auto_dz_cache_lru[int(frame_index)] = dz
             self._auto_dz_cache_lru.move_to_end(int(frame_index))
@@ -198,6 +252,13 @@ class MainWindow(ctk.CTk):
             pass
 
     def _set_preview_bgr(self, bgr, *, target: str = "main") -> None:
+        """
+        Преобразует BGR (OpenCV) -> RGB (PIL) -> CTkImage и подставляет в label.
+
+        Параметр `target`:
+        - `"main"`: основное превью
+        - `"mask"`: панель маски (если включена)
+        """
         lbl = self.preview_main if target == "main" else self.preview_mask
         try:
             if target == "main":
@@ -223,6 +284,7 @@ class MainWindow(ctk.CTk):
         lbl.configure(image=ctkimg, text="")
 
     def _schedule_preview_rescale(self) -> None:
+        """Делаем debounce для частых `<Configure>` событий при ресайзе окна."""
         # Debounce frequent <Configure> events.
         if self._preview_rescale_after_id is not None:
             try:
@@ -233,6 +295,7 @@ class MainWindow(ctk.CTk):
         self._preview_rescale_after_id = self.after(60, self._rescale_preview_from_cache)
 
     def _rescale_preview_from_cache(self) -> None:
+        """Перерисовывает CTkImage из сохранённых BGR-картинок (без пересчёта детекции/масок)."""
         self._preview_rescale_after_id = None
         if self._last_preview_bgr_main is not None and getattr(self._last_preview_bgr_main, "size", 0) != 0:
             self._set_preview_bgr(self._last_preview_bgr_main, target="main")
@@ -244,6 +307,11 @@ class MainWindow(ctk.CTk):
             self._set_preview_bgr(self._last_preview_bgr_mask, target="mask")
 
     def _set_mask_panel_visible(self, visible: bool) -> None:
+        """
+        Показывает/скрывает правую колонку с маской и подстраивает grid layout.
+
+        Важно: при скрытии маски основной preview должен занимать всю ширину.
+        """
         self._preview_mask_visible = bool(visible)
         # When mask panel is hidden, let the main preview span the full width.
         try:
@@ -267,6 +335,7 @@ class MainWindow(ctk.CTk):
         self._schedule_preview_rescale()
 
     def _get_road_params(self) -> RoadAreaParams:
+        """Собирает `RoadAreaParams` из текущих значений UI-переменных."""
         thr = float(self._road_color_thresh_var.get())
         return RoadAreaParams(
             color_dist_thresh=max(1.0, min(60.0, thr)),
@@ -278,6 +347,7 @@ class MainWindow(ctk.CTk):
         )
 
     def _on_perspective_toggle(self) -> None:
+        """Обработчик чекбокса перспективы: синхронизирует параметр с процессором и обновляет превью."""
         if self._processor.is_running():
             self._processor.set_road_params(use_perspective=bool(self._use_perspective_var.get()))
         # perspective changes can affect both ROI-from-road and the overlay
@@ -287,6 +357,7 @@ class MainWindow(ctk.CTk):
             self._render_preview_from_last()
 
     def _open_perspective_calib_dialog(self) -> None:
+        """Открывает модальный диалог калибровки, используя последний доступный кадр превью."""
         fr = self._last_frame
         if fr is None or fr.frame_bgr is None or getattr(fr.frame_bgr, "size", 0) == 0:
             messagebox.showinfo("Калибровка", "Сначала откройте видео и получите кадр (Старт или предпросмотр).")
@@ -300,6 +371,7 @@ class MainWindow(ctk.CTk):
         )
 
     def _get_roi_pct_clamped(self) -> RoiPct:
+        """Возвращает ROI из UI (в процентах) с применением clamp (границы 0..100 и валидная ширина/высота)."""
         roi = RoiPct(
             x=float(self.roi_x.get()),
             y=float(self.roi_y.get()),
@@ -309,6 +381,7 @@ class MainWindow(ctk.CTk):
         return roi
 
     def _apply_roi_to_vars(self, roi: RoiPct) -> None:
+        """Записывает ROI в tk-переменные без запуска рекурсивных trace'ов."""
         # avoid recursive traces
         self._roi_internal_update = True
         try:
@@ -320,6 +393,7 @@ class MainWindow(ctk.CTk):
             self._roi_internal_update = False
 
     def _set_roi_controls_enabled(self, enabled: bool) -> None:
+        """Включает/выключает ручные ROI-слайдеры (когда включён авто-режим — отключаем)."""
         state = "normal" if enabled else "disabled"
         for s in self._roi_sliders:
             try:
@@ -329,6 +403,7 @@ class MainWindow(ctk.CTk):
                 pass
 
     def _apply_roi_pct(self, roi: RoiPct) -> None:
+        """Применяет ROI (ручной режим): обновляет UI, процессор (если запущен) и превью."""
         # manual ROI sliders define a rectangle; keep them, but convert later for processing/drawing
         roi = roi.clamp()
         self._apply_roi_to_vars(roi)
@@ -338,6 +413,13 @@ class MainWindow(ctk.CTk):
         self._render_preview_from_last()
 
     def _auto_roi_recompute(self, *, force: bool = False) -> None:
+        """
+        Пересчитывает auto danger_zone (по маске дороги / fallback по линиям) и обновляет превью.
+
+        Параметр `force`:
+        - True: пересчитать немедленно (игнорируя throttle и LRU)
+        - False: использовать LRU/ограничение частоты, чтобы избежать дрожания и нагрузки
+        """
         if not bool(self.roi_auto_var.get()):
             return
         fr = self._last_frame
@@ -386,6 +468,7 @@ class MainWindow(ctk.CTk):
             est = estimate_danger_zone_pct(fr.frame_bgr)
 
         # Smooth to avoid flicker on noisy lines
+        # EMA-сглаживание точек трапеции: уменьшает визуальное "дёргание" зоны.
         alpha = float(self._AUTO_ROI_ALPHA)
         prev = self._auto_roi_smoothed
         if prev is None:
@@ -409,6 +492,7 @@ class MainWindow(ctk.CTk):
         self._render_preview_from_last()
 
     def _on_auto_roi_toggle(self) -> None:
+        """Обработчик чекбокса авто danger_zone: переключает режим в процессоре и пересчитывает зону."""
         enabled = bool(self.roi_auto_var.get())
         self._set_roi_controls_enabled(not enabled)
         if self._processor.is_running():
@@ -422,6 +506,7 @@ class MainWindow(ctk.CTk):
             self._auto_roi_recompute(force=True)
 
     def _update_roi_value_labels(self) -> None:
+        """Обновляет подписи X/Y/W/H рядом со слайдерами ROI."""
         # show as percents with 0 decimals (sliders are integer-stepped)
         if "X" in self._roi_value_labels:
             self._roi_value_labels["X"].configure(text=f"{self.roi_x.get():.0f}%")
@@ -433,6 +518,15 @@ class MainWindow(ctk.CTk):
             self._roi_value_labels["H"].configure(text=f"{self.roi_h.get():.0f}%")
 
     def _render_preview_from_last(self) -> None:
+        """
+        Перерисовывает превью на основе `self._last_frame`.
+
+        Здесь намеренно нет тяжёлой обработки (YOLO и экспорт живут в `VideoProcessor`).
+        Метод:
+        - выбирает danger_zone (ручной ROI или auto по дороге)
+        - при необходимости строит/берёт road mask (и debug-вид)
+        - вызывает `draw_annotations()` и отправляет BGR в `_set_preview_bgr()`
+        """
         fr = self._last_frame
         if fr is None:
             return
@@ -457,6 +551,8 @@ class MainWindow(ctk.CTk):
             dz_px = danger_zone_pct_to_px(dz, w, h)
 
         # recompute obstructing for the preview (so pause + ROI move feels instant)
+        # В режиме паузы/при движении ROI хотим мгновенную обратную связь,
+        # поэтому пересчитываем obstructing прямо тут (на последнем наборе person bbox).
         frame_area = float(w * h) if w > 0 and h > 0 else 1.0
         min_area = (float(self.min_area_var.get()) / 100.0) * frame_area
         obstructing = False
@@ -468,6 +564,7 @@ class MainWindow(ctk.CTk):
                 break
 
         # Optional debug view for road segmentation
+        # Road Debug: позволяет визуализировать промежуточные карты сегментации дороги.
         view = str(self._road_debug_mode_var.get() or "Обычный")
         base_bgr = fr.frame_bgr
         if view != "Обычный":
@@ -528,6 +625,7 @@ class MainWindow(ctk.CTk):
             self.preview_mask.configure(image=None, text="Маска недоступна")
 
     def _on_roi_change(self) -> None:
+        """Обработчик изменения ROI-слайдеров: clamp, синхронизация UI и обновление превью/процессора."""
         if self._roi_internal_update:
             return
         # ignore manual changes when auto-mode is enabled (sliders are disabled, but keep it safe)
@@ -551,6 +649,7 @@ class MainWindow(ctk.CTk):
         self._render_preview_from_last()
 
     def _try_show_first_frame(self, path: str) -> None:
+        """Пытается открыть видео и показать первый кадр в превью (чтобы UI был "живым" до старта)."""
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             self.preview_main.configure(image=None, text="Не удалось открыть видео для предпросмотра")
@@ -578,6 +677,7 @@ class MainWindow(ctk.CTk):
             cap.release()
 
     def _build_ui(self) -> None:
+        """Собирает layout главного окна (grid) и подключает UI-компоненты из `sidebar`/`preview_panel`."""
         self.grid_columnconfigure(0, weight=0)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -594,6 +694,7 @@ class MainWindow(ctk.CTk):
         to: float,
         base_row: int,
     ) -> None:
+        """Утилита для sidebar: добавляет слайдер ROI + числовую подпись значения."""
         # header row: name + numeric value
         ctk.CTkLabel(parent, text=f"{label}:", anchor="w").grid(row=base_row, column=0, sticky="w", padx=10, pady=(0, 0))
         val_lbl = ctk.CTkLabel(parent, text="", anchor="e", text_color="#bbb")
@@ -606,6 +707,7 @@ class MainWindow(ctk.CTk):
         self._roi_sliders.append(s)
 
     def _on_open_video(self) -> None:
+        """Открывает диалог выбора файла видео и инициализирует предпросмотр/состояние UI."""
         path = filedialog.askopenfilename(
             title="Выберите видео",
             filetypes=[
@@ -631,6 +733,7 @@ class MainWindow(ctk.CTk):
             self._set_mask_panel_visible(False)
 
     def _on_choose_outdir(self) -> None:
+        """Открывает диалог выбора папки вывода (для экспорта видео/JSON)."""
         d = filedialog.askdirectory(title="Папка вывода")
         if not d:
             return
@@ -638,6 +741,7 @@ class MainWindow(ctk.CTk):
         self.lbl_outdir.configure(text=d)
 
     def _on_start(self) -> None:
+        """Запускает обработку видео в `VideoProcessor` с текущими настройками UI."""
         if self._processor.is_running():
             return
         if not self._video_path:
@@ -697,6 +801,7 @@ class MainWindow(ctk.CTk):
             messagebox.showerror("Ошибка запуска", str(e))
 
     def _on_pause_toggle(self) -> None:
+        """Ставит обработку на паузу/продолжает (через `VideoProcessor.pause/resume`)."""
         if not self._processor.is_running():
             return
         self._paused = not self._paused
@@ -711,12 +816,18 @@ class MainWindow(ctk.CTk):
             self.lbl_status.configure(text="Статус: воспроизведение…")
 
     def _on_stop(self) -> None:
+        """Останавливает обработку (best-effort) и обновляет UI-статус."""
         self._processor.stop()
         self.lbl_status.configure(text="Статус: остановка…")
         self._paused = False
         self.btn_pause.configure(text="Пауза")
 
     def _tick(self) -> None:
+        """
+        Таймер UI: регулярно забирает элементы из `VideoProcessor.poll()` и применяет их.
+
+        Почему так: Tkinter не потокобезопасен, поэтому любые обновления UI делаем только в главном потоке.
+        """
         # Pull results from worker thread
         for item in self._processor.poll(max_items=10):
             if isinstance(item, Exception):
@@ -734,6 +845,7 @@ class MainWindow(ctk.CTk):
         self.after(30, self._tick)
 
     def _apply_progress(self, p: ProcessorProgress) -> None:
+        """Обновляет прогресс-бар и статус-строку по `ProcessorProgress`."""
         if p.frame_count > 0:
             self.progress.set(min(1.0, max(0.0, p.frame_index / p.frame_count)))
         else:
@@ -745,6 +857,11 @@ class MainWindow(ctk.CTk):
         self.lbl_status.configure(text=f"Статус: {state} | кадр {p.frame_index} / {p.frame_count} | {st}")
 
     def _apply_frame(self, fr: FrameResult) -> None:
+        """
+        Принимает очередной кадр от процессора и обновляет превью.
+
+        Если включён авто-режим danger_zone, то пересчитываем/обновляем его по throttling-правилам.
+        """
         self._last_frame = fr
         if bool(self.roi_auto_var.get()):
             # Если воспроизведение стартует заново (frame_index сбросился),
