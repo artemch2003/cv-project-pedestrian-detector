@@ -8,10 +8,10 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
 
 from pedblock import __version__ as app_version
-from pedblock.core.camera_calib import DEFAULT_CALIB_PATH, CameraCalib, load_camera_calib, order_quad_tl_tr_br_bl, save_camera_calib
+from pedblock.core.camera_calib import DEFAULT_CALIB_PATH
 from pedblock.core.config import DetectionConfig, ExportConfig, RoiPct
 from pedblock.core.auto_roi import estimate_danger_zone_pct
 from pedblock.core.danger_zone import DangerZonePct, danger_zone_pct_to_px
@@ -19,9 +19,16 @@ from pedblock.core.road_area import RoadAreaParams, RoadDebug, danger_zone_pct_f
 from pedblock.core.processor import FrameResult, ProcessorProgress, VideoProcessor
 from pedblock.core.types import FrameInfo
 from pedblock.core.annotate import draw_annotations
+from pedblock.ui.perspective_calib_dialog import open_perspective_calib_dialog
+from pedblock.ui.sidebar import build_sidebar
+from pedblock.ui.preview_panel import build_preview_panel
 
 
 class MainWindow(ctk.CTk):
+    _AUTO_ROI_ALPHA = 0.30
+    _AUTO_ROI_EVERY_N_MIN = 1
+    _AUTO_ROI_EVERY_N_MAX = 60
+
     def __init__(self) -> None:
         super().__init__()
         self.title(f"Pedestrian Blocker v{app_version} — YOLO + CustomTkinter")
@@ -73,6 +80,50 @@ class MainWindow(ctk.CTk):
         if bool(self._dz_max_width_var.get()):
             return "max_width"
         return "fit"
+
+    def _refresh_preview_after_road_param_change(self, *, force_auto_roi: bool = True) -> None:
+        """
+        Общая логика для слайдеров/чекбоксов road-детекции:
+        - если включён авто danger_zone (по маске дороги) — пересчитать,
+        - иначе — просто перерисовать превью по последнему кадру.
+        """
+        try:
+            auto_enabled = bool(getattr(self, "roi_auto_var", tk.BooleanVar(value=False)).get())
+        except Exception:
+            auto_enabled = False
+        if auto_enabled:
+            self._auto_roi_recompute(force=bool(force_auto_roi))
+        else:
+            self._render_preview_from_last()
+
+    def _on_show_road_mask_changed(self) -> None:
+        if self._processor.is_running():
+            self._processor.set_show_road_mask(bool(self.show_road_mask_var.get()))
+        # Overlay toggle doesn't require recompute; just redraw.
+        self._render_preview_from_last()
+
+    def _on_road_color_thresh_changed(self) -> None:
+        self._road_thresh_lbl.configure(text=f"{self._road_color_thresh_var.get():.1f}")
+        if self._processor.is_running():
+            self._processor.set_road_params(color_dist_thresh=float(self._road_color_thresh_var.get()))
+        self._refresh_preview_after_road_param_change(force_auto_roi=True)
+
+    def _on_dz_near_bottom_changed(self) -> None:
+        self._dz_near_bottom_lbl.configure(text=f"{self._dz_near_bottom_var.get():.0f}")
+        if self._processor.is_running():
+            self._processor.set_road_params(dz_near_bottom_frac=float(self._dz_near_bottom_var.get()) / 100.0)
+        self._refresh_preview_after_road_param_change(force_auto_roi=True)
+
+    def _on_dz_edge_q_changed(self) -> None:
+        self._dz_edge_q_lbl.configure(text=f"{self._dz_edge_q_var.get():.0f}")
+        if self._processor.is_running():
+            self._processor.set_road_params(dz_edge_quantile=float(self._dz_edge_q_var.get()) / 100.0)
+        self._refresh_preview_after_road_param_change(force_auto_roi=True)
+
+    def _on_dz_method_changed(self) -> None:
+        if self._processor.is_running():
+            self._processor.set_road_params(dz_method=self._get_dz_method())
+        self._refresh_preview_after_road_param_change(force_auto_roi=True)
 
     def _get_preview_cache_key(self) -> tuple[object, ...] | None:
         # Cache is only meaningful when a video is selected.
@@ -240,155 +291,13 @@ class MainWindow(ctk.CTk):
         if fr is None or fr.frame_bgr is None or getattr(fr.frame_bgr, "size", 0) == 0:
             messagebox.showinfo("Калибровка", "Сначала откройте видео и получите кадр (Старт или предпросмотр).")
             return
-
-        # Copy frame to avoid accidental mutation
-        frame_bgr = fr.frame_bgr.copy()
-        h, w = frame_bgr.shape[:2]
-
-        top = ctk.CTkToplevel(self)
-        top.title("Калибровка перспективы (OpenADAS)")
-        top.geometry("980x720")
-        top.grab_set()
-
-        info = (
-            "Кликните 4 точки на кадре (порядок не важен — я сам нормализую в TL/TR/BR/BL).\n"
-            "TL/TR — дальние (выше на кадре), BL/BR — ближние (ниже на кадре).\n"
-            "Далее введите измерения (метры): L1/L2 — расстояния до ближней/дальней линии, "
-            "W1/W2 — ширина дороги на этих дистанциях."
+        open_perspective_calib_dialog(
+            self,
+            frame_bgr=fr.frame_bgr,
+            use_perspective_var=self._use_perspective_var,
+            on_perspective_toggle=self._on_perspective_toggle,
+            calib_path=DEFAULT_CALIB_PATH,
         )
-        ctk.CTkLabel(top, text=info, anchor="w", justify="left", wraplength=940).pack(padx=14, pady=(14, 8), fill="x")
-
-        frm = ctk.CTkFrame(top)
-        frm.pack(padx=14, pady=(0, 10), fill="x")
-        frm.grid_columnconfigure(0, weight=1)
-        frm.grid_columnconfigure(1, weight=1)
-        frm.grid_columnconfigure(2, weight=1)
-        frm.grid_columnconfigure(3, weight=1)
-        frm.grid_columnconfigure(4, weight=1)
-
-        def _mk_entry(col: int, label: str, default: str) -> tk.Entry:
-            ctk.CTkLabel(frm, text=label, anchor="w").grid(row=0, column=col, sticky="ew", padx=8, pady=(10, 0))
-            e = tk.Entry(frm)
-            e.insert(0, default)
-            e.grid(row=1, column=col, sticky="ew", padx=8, pady=(0, 10))
-            return e
-
-        existing = load_camera_calib(DEFAULT_CALIB_PATH)
-        eL1 = _mk_entry(0, "L1 (м):", f"{existing.L1_m:.2f}" if existing else "5.00")
-        eL2 = _mk_entry(1, "L2 (м):", f"{existing.L2_m:.2f}" if existing else "20.00")
-        eW1 = _mk_entry(2, "W1 (м):", f"{existing.W1_m:.2f}" if existing else "3.50")
-        eW2 = _mk_entry(3, "W2 (м):", f"{existing.W2_m:.2f}" if existing else "3.50")
-        ePPM = _mk_entry(4, "px/м:", f"{existing.px_per_meter:.1f}" if existing else "60.0")
-
-        ctk.CTkLabel(top, text=f"Файл: {DEFAULT_CALIB_PATH}", anchor="w", text_color="#bbb").pack(
-            padx=14, pady=(0, 8), fill="x"
-        )
-
-        # Canvas preview
-        canvas = tk.Canvas(top, bg="black", width=940, height=520, highlightthickness=0)
-        canvas.pack(padx=14, pady=(0, 10), fill="both", expand=True)
-
-        # Fit frame into canvas
-        max_w, max_h = 940, 520
-        scale = min(max_w / max(1, w), max_h / max(1, h))
-        disp_w = int(round(w * scale))
-        disp_h = int(round(h * scale))
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        pil_base = Image.fromarray(frame_rgb).resize((disp_w, disp_h))
-
-        points: list[tuple[float, float]] = []
-        imgtk_holder: dict[str, ImageTk.PhotoImage] = {}
-
-        def _render() -> None:
-            img = pil_base.copy()
-            # draw points and poly
-            arr = np.array(img)
-            # point markers
-            labels = ["P1", "P2", "P3", "P4"]
-            ordered: list[tuple[float, float]] | None = None
-            if len(points) == 4:
-                try:
-                    ordered = order_quad_tl_tr_br_bl(points)
-                    labels = ["TL", "TR", "BR", "BL"]
-                except Exception:
-                    ordered = None
-
-            draw_pts = ordered if ordered is not None else points
-            for i, (px, py) in enumerate(draw_pts):
-                dx = int(round(px * scale))
-                dy = int(round(py * scale))
-                cv2.circle(arr, (dx, dy), 6, (255, 120, 0), -1)
-                cv2.putText(arr, labels[i], (dx + 8, dy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 220, 0), 2)
-            if ordered is not None:
-                poly = np.array([(int(round(x * scale)), int(round(y * scale))) for (x, y) in ordered], dtype=np.int32)
-                cv2.polylines(arr, [poly], isClosed=True, color=(0, 255, 255), thickness=2)
-            img2 = Image.fromarray(arr)
-            imgtk = ImageTk.PhotoImage(img2)
-            imgtk_holder["img"] = imgtk
-            canvas.delete("all")
-            canvas.create_image(0, 0, image=imgtk, anchor="nw")
-
-        def _on_click(ev) -> None:
-            nonlocal points
-            if len(points) >= 4:
-                return
-            x_disp = float(ev.x)
-            y_disp = float(ev.y)
-            if x_disp < 0 or y_disp < 0 or x_disp >= disp_w or y_disp >= disp_h:
-                return
-            x_orig = x_disp / scale
-            y_orig = y_disp / scale
-            points.append((float(x_orig), float(y_orig)))
-            _render()
-
-        canvas.bind("<Button-1>", _on_click)
-
-        # preload points from existing calib (if any)
-        if existing is not None:
-            try:
-                points = [(float(x), float(y)) for (x, y) in existing.image_points_px]
-            except Exception:
-                points = []
-        _render()
-
-        frm_btn = ctk.CTkFrame(top)
-        frm_btn.pack(padx=14, pady=(0, 14), fill="x")
-        frm_btn.grid_columnconfigure(0, weight=1)
-        frm_btn.grid_columnconfigure(1, weight=1)
-        frm_btn.grid_columnconfigure(2, weight=1)
-
-        def _reset() -> None:
-            nonlocal points
-            points = []
-            _render()
-
-        def _save() -> None:
-            try:
-                if len(points) != 4:
-                    raise ValueError("Нужно выбрать 4 точки")
-                pts = order_quad_tl_tr_br_bl(points)
-                calib = CameraCalib(
-                    image_points_px=[(float(x), float(y)) for (x, y) in pts],
-                    L1_m=float(eL1.get()),
-                    L2_m=float(eL2.get()),
-                    W1_m=float(eW1.get()),
-                    W2_m=float(eW2.get()),
-                    px_per_meter=float(ePPM.get()),
-                )
-                save_camera_calib(calib, DEFAULT_CALIB_PATH)
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось сохранить калибровку: {e}")
-                return
-
-            # Enable perspective mode immediately
-            self._use_perspective_var.set(True)
-            self._on_perspective_toggle()
-            messagebox.showinfo("Готово", "Калибровка сохранена. Перспективный режим включён.")
-            top.destroy()
-
-        ctk.CTkButton(frm_btn, text="Сбросить точки", command=_reset).grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=10)
-        ctk.CTkButton(frm_btn, text="Сохранить", command=_save).grid(row=0, column=1, sticky="ew", padx=(8, 8), pady=10)
-        ctk.CTkButton(frm_btn, text="Закрыть", command=top.destroy).grid(row=0, column=2, sticky="ew", padx=(8, 0), pady=10)
 
     def _get_roi_pct_clamped(self) -> RoiPct:
         roi = RoiPct(
@@ -453,7 +362,7 @@ class MainWindow(ctk.CTk):
         if not force:
             last_idx = self._auto_roi_last_frame_index
             every_n = int(self._auto_roi_every_n_frames_var.get() or 1)
-            every_n = max(1, min(60, every_n))
+            every_n = max(self._AUTO_ROI_EVERY_N_MIN, min(self._AUTO_ROI_EVERY_N_MAX, every_n))
             if last_idx is not None and (fr.frame_info.frame_index - last_idx) < every_n:
                 return
 
@@ -471,13 +380,13 @@ class MainWindow(ctk.CTk):
         if self._auto_road_mask_u8 is not None and getattr(self._auto_road_mask_u8, "size", 0) != 0:
             self._lru_put_mask(fr.frame_info.frame_index, self._auto_road_mask_u8)
 
-        est = danger_zone_pct_from_road_mask(self._auto_road_mask_u8, self._get_road_params())
+        est = danger_zone_pct_from_road_mask(self._auto_road_mask_u8, rp)
         # 2) Fallback: old line-based trapezoid (still helpful if mask failed)
         if est is None:
             est = estimate_danger_zone_pct(fr.frame_bgr)
 
         # Smooth to avoid flicker on noisy lines
-        alpha = 0.30
+        alpha = float(self._AUTO_ROI_ALPHA)
         prev = self._auto_roi_smoothed
         if prev is None:
             sm = est
@@ -673,324 +582,8 @@ class MainWindow(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # Left panel: controls (scrollable)
-        left_outer = ctk.CTkFrame(self)
-        left_outer.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
-        left_outer.grid_columnconfigure(0, weight=1)
-        left_outer.grid_rowconfigure(1, weight=1)
-
-        hdr = ctk.CTkFrame(left_outer, fg_color="transparent")
-        hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
-        hdr.grid_columnconfigure(0, weight=1)
-
-        title = ctk.CTkLabel(hdr, text="Настройки", font=ctk.CTkFont(size=18, weight="bold"))
-        title.grid(row=0, column=0, sticky="w")
-
-        ver = ctk.CTkLabel(hdr, text=f"v{app_version}", text_color="#888")
-        ver.grid(row=0, column=1, sticky="e")
-
-        left = ctk.CTkScrollableFrame(left_outer, width=380)
-        left.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
-        left.grid_columnconfigure(0, weight=1)
-
-        self.btn_open = ctk.CTkButton(left, text="Открыть видео…", command=self._on_open_video)
-        self.btn_open.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
-
-        self.lbl_video = ctk.CTkLabel(left, text="Видео: (не выбрано)", anchor="w", justify="left", wraplength=340)
-        self.lbl_video.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
-
-        # Model / device
-        frm_md = ctk.CTkFrame(left)
-        frm_md.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        frm_md.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(frm_md, text="Модель YOLO (Ultralytics):", anchor="w").grid(
-            row=0, column=0, sticky="ew", padx=10, pady=(10, 4)
-        )
-        self.model_var = tk.StringVar(value="yolo11n.pt")
-        self.model_entry = ctk.CTkEntry(frm_md, textvariable=self.model_var)
-        self.model_entry.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
-        ctk.CTkLabel(frm_md, text="Напр.: yolo11n.pt / yolov8n.pt / путь к .pt", anchor="w", text_color="#888").grid(
-            row=2, column=0, sticky="ew", padx=10, pady=(0, 10)
-        )
-
-        ctk.CTkLabel(frm_md, text="Устройство:", anchor="w").grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 4))
-        self.device_var = tk.StringVar(value="auto")
-        self.device_menu = ctk.CTkOptionMenu(frm_md, variable=self.device_var, values=["auto", "cpu", "mps", "cuda"])
-        self.device_menu.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
-
-        # Thresholds
-        frm_thr = ctk.CTkFrame(left)
-        frm_thr.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 12))
-        frm_thr.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(frm_thr, text="Порог confidence:", anchor="w").grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
-        self.conf_var = tk.DoubleVar(value=0.30)
-        self.conf_slider = ctk.CTkSlider(frm_thr, from_=0.05, to=0.95, variable=self.conf_var, number_of_steps=90)
-        self.conf_slider.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
-        self.conf_lbl = ctk.CTkLabel(frm_thr, text="0.30", anchor="w")
-        self.conf_lbl.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
-
-        ctk.CTkLabel(frm_thr, text="Минимальная площадь bbox (% кадра):", anchor="w").grid(
-            row=3, column=0, sticky="ew", padx=10, pady=(0, 0)
-        )
-        self.min_area_var = tk.DoubleVar(value=0.20)
-        self.min_area_slider = ctk.CTkSlider(frm_thr, from_=0.01, to=5.0, variable=self.min_area_var, number_of_steps=250)
-        self.min_area_slider.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 6))
-        self.min_area_lbl = ctk.CTkLabel(frm_thr, text="0.20%", anchor="w")
-        self.min_area_lbl.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 10))
-
-        # ROI
-        frm_roi = ctk.CTkFrame(left)
-        frm_roi.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 12))
-        frm_roi.grid_columnconfigure(0, weight=1)
-        frm_roi.grid_columnconfigure(1, weight=0)
-
-        ctk.CTkLabel(frm_roi, text="ROI (проценты кадра):", anchor="w").grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
-        self.roi_x = tk.DoubleVar(value=35.0)
-        self.roi_y = tk.DoubleVar(value=55.0)
-        self.roi_w = tk.DoubleVar(value=30.0)
-        self.roi_h = tk.DoubleVar(value=40.0)
-
-        self._add_roi_slider(frm_roi, "X", self.roi_x, 0, 100, base_row=1)
-        self._add_roi_slider(frm_roi, "Y", self.roi_y, 0, 100, base_row=3)
-        self._add_roi_slider(frm_roi, "W", self.roi_w, 1, 100, base_row=5)
-        self._add_roi_slider(frm_roi, "H", self.roi_h, 1, 100, base_row=7)
-
-        self.roi_auto_var = tk.BooleanVar(value=False)
-        self.chk_auto_roi = ctk.CTkCheckBox(
-            frm_roi,
-            text="Авто danger_zone (по проезжей части)",
-            variable=self.roi_auto_var,
-            command=self._on_auto_roi_toggle,
-        )
-        self.chk_auto_roi.grid(row=9, column=0, sticky="w", padx=10, pady=(0, 6))
-
-        self.btn_roi_recalc = ctk.CTkButton(frm_roi, text="Пересчитать по кадру", command=lambda: self._auto_roi_recompute(force=True))
-        self.btn_roi_recalc.grid(row=9, column=1, sticky="e", padx=(0, 10), pady=(0, 6))
-
-        # Show road mask overlay
-        self.show_road_mask_var = tk.BooleanVar(value=False)
-        self.chk_show_road = ctk.CTkCheckBox(frm_roi, text="Показывать маску проезжей части", variable=self.show_road_mask_var)
-        self.chk_show_road.grid(row=12, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
-        self.show_road_mask_var.trace_add(
-            "write",
-            lambda *_: (
-                self._processor.set_show_road_mask(bool(self.show_road_mask_var.get())) if self._processor.is_running() else None,
-                self._render_preview_from_last(),
-            ),
-        )
-
-        # Road segmentation strictness (color threshold)
-        ctk.CTkLabel(frm_roi, text="Строгость маски (цвет, меньше = строже):", anchor="w", text_color="#bbb").grid(
-            row=13, column=0, sticky="w", padx=10, pady=(0, 0)
-        )
-        self._road_thresh_lbl = ctk.CTkLabel(frm_roi, text="7.5", anchor="e", text_color="#bbb")
-        self._road_thresh_lbl.grid(row=13, column=1, sticky="e", padx=(0, 10), pady=(0, 0))
-        self._road_thresh_slider = ctk.CTkSlider(
-            frm_roi,
-            from_=2.0,
-            to=25.0,
-            variable=self._road_color_thresh_var,
-            number_of_steps=230,
-        )
-        self._road_thresh_slider.grid(row=14, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
-        self._road_color_thresh_var.trace_add(
-            "write",
-            lambda *_: (
-                self._road_thresh_lbl.configure(text=f"{self._road_color_thresh_var.get():.1f}"),
-                self._processor.set_road_params(color_dist_thresh=float(self._road_color_thresh_var.get())) if self._processor.is_running() else None,
-                self._auto_roi_recompute(force=True) if bool(self.roi_auto_var.get()) else self._render_preview_from_last(),
-            ),
-        )
-
-        # Danger-zone tuning from road mask
-        ctk.CTkLabel(frm_roi, text="Высота danger_zone от низа (%):", anchor="w", text_color="#bbb").grid(
-            row=19, column=0, sticky="w", padx=10, pady=(0, 0)
-        )
-        self._dz_near_bottom_lbl = ctk.CTkLabel(frm_roi, text="35", anchor="e", text_color="#bbb")
-        self._dz_near_bottom_lbl.grid(row=19, column=1, sticky="e", padx=(0, 10), pady=(0, 0))
-        self._dz_near_bottom_slider = ctk.CTkSlider(frm_roi, from_=15.0, to=60.0, variable=self._dz_near_bottom_var, number_of_steps=45)
-        self._dz_near_bottom_slider.grid(row=20, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
-        self._dz_near_bottom_var.trace_add(
-            "write",
-            lambda *_: (
-                self._dz_near_bottom_lbl.configure(text=f"{self._dz_near_bottom_var.get():.0f}"),
-                self._processor.set_road_params(dz_near_bottom_frac=float(self._dz_near_bottom_var.get()) / 100.0)
-                if self._processor.is_running()
-                else None,
-                self._auto_roi_recompute(force=True) if bool(self.roi_auto_var.get()) else self._render_preview_from_last(),
-            ),
-        )
-
-        ctk.CTkLabel(frm_roi, text="Отсечь края маски (%):", anchor="w", text_color="#bbb").grid(
-            row=21, column=0, sticky="w", padx=10, pady=(0, 0)
-        )
-        self._dz_edge_q_lbl = ctk.CTkLabel(frm_roi, text="6", anchor="e", text_color="#bbb")
-        self._dz_edge_q_lbl.grid(row=21, column=1, sticky="e", padx=(0, 10), pady=(0, 0))
-        self._dz_edge_q_slider = ctk.CTkSlider(frm_roi, from_=0.0, to=15.0, variable=self._dz_edge_q_var, number_of_steps=150)
-        self._dz_edge_q_slider.grid(row=22, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
-        self._dz_edge_q_var.trace_add(
-            "write",
-            lambda *_: (
-                self._dz_edge_q_lbl.configure(text=f"{self._dz_edge_q_var.get():.0f}"),
-                self._processor.set_road_params(dz_edge_quantile=float(self._dz_edge_q_var.get()) / 100.0)
-                if self._processor.is_running()
-                else None,
-                self._auto_roi_recompute(force=True) if bool(self.roi_auto_var.get()) else self._render_preview_from_last(),
-            ),
-        )
-
-        # Danger-zone method from road mask
-        self._dz_max_width_chk = ctk.CTkCheckBox(
-            frm_roi,
-            text="Трапеция по макс. ширине маски дороги",
-            variable=self._dz_max_width_var,
-        )
-        self._dz_max_width_chk.grid(row=23, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
-        self._dz_max_width_var.trace_add(
-            "write",
-            lambda *_: (
-                self._processor.set_road_params(dz_method=self._get_dz_method())
-                if self._processor.is_running()
-                else None,
-                self._auto_roi_recompute(force=True) if bool(self.roi_auto_var.get()) else self._render_preview_from_last(),
-            ),
-        )
-
-        self._dz_hough_chk = ctk.CTkCheckBox(
-            frm_roi,
-            text="Боковые линии по границам маски (Hough)",
-            variable=self._dz_hough_sides_var,
-        )
-        self._dz_hough_chk.grid(row=24, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
-        self._dz_hough_sides_var.trace_add(
-            "write",
-            lambda *_: (
-                self._processor.set_road_params(dz_method=self._get_dz_method())
-                if self._processor.is_running()
-                else None,
-                self._auto_roi_recompute(force=True) if bool(self.roi_auto_var.get()) else self._render_preview_from_last(),
-            ),
-        )
-
-        # Debug view selector
-        ctk.CTkLabel(frm_roi, text="Road Debug (превью):", anchor="w", text_color="#bbb").grid(
-            row=15, column=0, sticky="w", padx=10, pady=(0, 0)
-        )
-        self._road_debug_menu = ctk.CTkOptionMenu(
-            frm_roi,
-            variable=self._road_debug_mode_var,
-            values=["Обычный", "Canny", "Коридор", "Seed", "Dist", "Candidate", "Final"],
-            command=lambda *_: self._render_preview_from_last(),
-        )
-        self._road_debug_menu.grid(row=16, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
-
-        # OpenADAS-style perspective mode (bird-view calibration)
-        self.chk_perspective = ctk.CTkCheckBox(
-            frm_roi,
-            text="Перспектива (OpenADAS): bird-view калибровка",
-            variable=self._use_perspective_var,
-            command=self._on_perspective_toggle,
-        )
-        self.chk_perspective.grid(row=17, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 6))
-
-        self.btn_calib = ctk.CTkButton(frm_roi, text="Калибровка перспективы…", command=self._open_perspective_calib_dialog)
-        self.btn_calib.grid(row=18, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
-
-        # Auto-ROI frequency (frames)
-        ctk.CTkLabel(frm_roi, text="Авто-обновление (кадров):", anchor="w", text_color="#bbb").grid(
-            row=10, column=0, sticky="w", padx=10, pady=(0, 0)
-        )
-        self._auto_roi_every_n_lbl = ctk.CTkLabel(frm_roi, text="5", anchor="e", text_color="#bbb")
-        self._auto_roi_every_n_lbl.grid(row=10, column=1, sticky="e", padx=(0, 10), pady=(0, 0))
-        self._auto_roi_every_n_slider = ctk.CTkSlider(
-            frm_roi,
-            from_=1,
-            to=30,
-            variable=self._auto_roi_every_n_frames_var,
-            number_of_steps=29,
-        )
-        self._auto_roi_every_n_slider.grid(row=11, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
-
-        # Export
-        frm_exp = ctk.CTkFrame(left)
-        frm_exp.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 12))
-        frm_exp.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(frm_exp, text="Экспорт:", anchor="w").grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
-        self.export_video_var = tk.BooleanVar(value=False)
-        self.export_json_var = tk.BooleanVar(value=True)
-        self.export_dir_var = tk.StringVar(value="")
-        self.chk_video = ctk.CTkCheckBox(frm_exp, text="Аннотированное видео (.mp4)", variable=self.export_video_var)
-        self.chk_json = ctk.CTkCheckBox(frm_exp, text="JSON события (интервалы 'мешает')", variable=self.export_json_var)
-        self.chk_video.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 4))
-        self.chk_json.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
-
-        self.btn_outdir = ctk.CTkButton(frm_exp, text="Папка вывода…", command=self._on_choose_outdir)
-        self.btn_outdir.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 6))
-        self.lbl_outdir = ctk.CTkLabel(frm_exp, text="(рядом с видео / pedblock_out)", anchor="w", wraplength=340)
-        self.lbl_outdir.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
-
-        # Run controls
-        frm_play = ctk.CTkFrame(left)
-        frm_play.grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 8))
-        frm_play.grid_columnconfigure(0, weight=1)
-        frm_play.grid_columnconfigure(1, weight=1)
-
-        self.btn_start = ctk.CTkButton(frm_play, text="Старт", command=self._on_start)
-        self.btn_pause = ctk.CTkButton(frm_play, text="Пауза", command=self._on_pause_toggle)
-        self.btn_start.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=10)
-        self.btn_pause.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=10)
-
-        self.btn_stop = ctk.CTkButton(left, text="Стоп", command=self._on_stop, fg_color="#7a2222", hover_color="#8f2a2a")
-        self.btn_stop.grid(row=8, column=0, sticky="ew", padx=12, pady=(0, 12))
-
-        self.realtime_var = tk.BooleanVar(value=True)
-        self.chk_realtime = ctk.CTkCheckBox(left, text="Воспроизведение по FPS (реальное время)", variable=self.realtime_var)
-        self.chk_realtime.grid(row=9, column=0, sticky="w", padx=12, pady=(0, 10))
-
-        self.progress = ctk.CTkProgressBar(left)
-        self.progress.grid(row=10, column=0, sticky="ew", padx=12, pady=(0, 8))
-        self.progress.set(0.0)
-        self.lbl_status = ctk.CTkLabel(left, text="Статус: ожидание", anchor="w", justify="left", wraplength=360)
-        self.lbl_status.grid(row=11, column=0, sticky="ew", padx=12, pady=(0, 12))
-
-        # Right panel: preview
-        right = ctk.CTkFrame(self)
-        right.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
-        right.grid_rowconfigure(0, weight=1)
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_columnconfigure(1, weight=0, minsize=0)
-        self._preview_right = right
-
-        self.preview_main = ctk.CTkLabel(
-            right,
-            text="Откройте видео и нажмите Старт",
-            anchor="center",
-        )
-        self.preview_main.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=12, pady=12)
-
-        self.preview_mask = ctk.CTkLabel(right, text="Маска (включите «Показывать маску…»)", anchor="center")
-        self.preview_mask.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
-        self.preview_mask.grid_remove()
-        self._preview_mask_visible = False
-
-        # Re-fit previews when user resizes the window.
-        self.preview_main.bind("<Configure>", lambda _e: self._schedule_preview_rescale())
-        self.preview_mask.bind("<Configure>", lambda _e: self._schedule_preview_rescale())
-        right.bind("<Configure>", lambda _e: self._schedule_preview_rescale())
-
-        # Bind updates for labels
-        self.conf_var.trace_add("write", lambda *_: self.conf_lbl.configure(text=f"{self.conf_var.get():.2f}"))
-        self.min_area_var.trace_add("write", lambda *_: self.min_area_lbl.configure(text=f"{self.min_area_var.get():.2f}%"))
-        self._auto_roi_every_n_frames_var.trace_add("write", lambda *_: self._auto_roi_every_n_lbl.configure(text=str(int(self._auto_roi_every_n_frames_var.get() or 1))))
-        # ROI realtime (values + apply)
-        self.roi_x.trace_add("write", lambda *_: self._on_roi_change())
-        self.roi_y.trace_add("write", lambda *_: self._on_roi_change())
-        self.roi_w.trace_add("write", lambda *_: self._on_roi_change())
-        self.roi_h.trace_add("write", lambda *_: self._on_roi_change())
-        self._update_roi_value_labels()
+        build_sidebar(self)
+        build_preview_panel(self)
 
     def _add_roi_slider(
         self,

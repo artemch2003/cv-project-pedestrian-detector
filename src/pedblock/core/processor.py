@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import time
+from dataclasses import replace
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -53,6 +54,14 @@ class _ControlCmd:
 
 
 class VideoProcessor:
+    _SPEED_MIN = 0.1
+    _SPEED_MAX = 8.0
+    _PROGRESS_EMIT_PERIOD_S = 0.2
+    _ROAD_DZ_ALPHA = 0.25
+
+    _DZ_MODE_ROI = "roi"
+    _DZ_MODE_ROAD = "road"
+
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -65,7 +74,7 @@ class VideoProcessor:
         self._roi_pct = RoiPct()
         self._danger_zone_pct: DangerZonePct | None = None
         self._danger_zone_manual_override = False
-        self._danger_zone_mode = "roi"
+        self._danger_zone_mode = self._DZ_MODE_ROI
         self._show_road_mask = False
         self._road_params = RoadAreaParams()
 
@@ -124,24 +133,19 @@ class VideoProcessor:
         dz_edge_quantile: float | None = None,
         dz_method: str | None = None,
     ) -> None:
-        # Keep the control message JSON/pickle-free: send only a tiny dict of primitives
-        payload: dict[str, float] = {}
+        # Keep the control message simple: send only a small dict of primitives.
+        # (For backward compatibility, _drain_ctrl accepts older float-coded values too.)
+        payload: dict[str, object] = {}
         if color_dist_thresh is not None:
             payload["color_dist_thresh"] = float(color_dist_thresh)
         if use_perspective is not None:
-            payload["use_perspective"] = 1.0 if bool(use_perspective) else 0.0
+            payload["use_perspective"] = bool(use_perspective)
         if dz_near_bottom_frac is not None:
             payload["dz_near_bottom_frac"] = float(dz_near_bottom_frac)
         if dz_edge_quantile is not None:
             payload["dz_edge_quantile"] = float(dz_edge_quantile)
         if dz_method is not None:
-            m = str(dz_method or "fit").strip().lower()
-            if m in ("max_width", "maxwidth", "max-width", "max"):
-                payload["dz_method"] = 1.0
-            elif m in ("hough", "lines", "mask_hough", "mask-lines"):
-                payload["dz_method"] = 2.0
-            else:
-                payload["dz_method"] = 0.0
+            payload["dz_method"] = str(dz_method or "fit").strip().lower()
         self._enqueue_ctrl(_ControlCmd(kind="road_params", value=payload))
 
     def set_danger_zone_pct(self, dz: DangerZonePct) -> None:
@@ -204,7 +208,7 @@ class VideoProcessor:
                 self._realtime = bool(cmd.value)
             elif cmd.kind == "speed":
                 v = float(cmd.value) if cmd.value is not None else 1.0
-                self._speed = max(0.1, min(8.0, v))
+                self._speed = max(self._SPEED_MIN, min(self._SPEED_MAX, v))
             elif cmd.kind == "roi":
                 try:
                     x, y, w, h = cmd.value  # type: ignore[misc]
@@ -233,18 +237,18 @@ class VideoProcessor:
                     self._danger_zone_pct = DangerZonePct(points=pts).clamp()
                     # Если мы в режиме "road", полигон может приходить как подсказка/фоллбек,
                     # но не должен отключать road-based расчёт на каждом кадре.
-                    self._danger_zone_manual_override = bool(self._danger_zone_mode != "road")
+                    self._danger_zone_manual_override = bool(self._danger_zone_mode != self._DZ_MODE_ROAD)
                 except Exception:
                     pass
             elif cmd.kind == "danger_zone_mode":
                 try:
                     m = str(cmd.value or "roi").strip().lower()
-                    if m not in ("roi", "road"):
-                        m = "roi"
+                    if m not in (self._DZ_MODE_ROI, self._DZ_MODE_ROAD):
+                        m = self._DZ_MODE_ROI
                     self._danger_zone_mode = m
                     # Switching mode should clear manual override (user intent is mode-driven).
                     self._danger_zone_manual_override = False
-                    if m == "roi":
+                    if m == self._DZ_MODE_ROI:
                         # ensure ROI->quad is the active zone baseline
                         self._danger_zone_pct = DangerZonePct.from_quad(
                             self._roi_pct.x,
@@ -266,50 +270,58 @@ class VideoProcessor:
             elif cmd.kind == "road_params":
                 try:
                     d = dict(cmd.value or {})  # type: ignore[arg-type]
-                    thr = d.get("color_dist_thresh", None)
-                    up = d.get("use_perspective", None)
-                    nb = d.get("dz_near_bottom_frac", None)
-                    dq = d.get("dz_edge_quantile", None)
-                    dm = d.get("dz_method", None)
-                    if dm is not None:
+                    updates: dict[str, object] = {}
+
+                    def _to_bool(v: object) -> bool:
+                        if isinstance(v, bool):
+                            return v
+                        if isinstance(v, (int, float)):
+                            return bool(v)
+                        s = str(v).strip().lower()
+                        if s in ("1", "true", "yes", "y", "on"):
+                            return True
+                        if s in ("0", "false", "no", "n", "off", ""):
+                            return False
+                        return bool(v)
+
+                    def _clamped_float(v: object, *, lo: float, hi: float) -> float:
                         try:
-                            dm_f = float(dm)
+                            fv = float(v)  # type: ignore[arg-type]
                         except Exception:
-                            dm_f = 0.0
-                        if dm_f >= 1.5:
-                            dz_method = "hough"
-                        elif dm_f >= 0.5:
-                            dz_method = "max_width"
-                        else:
-                            dz_method = "fit"
-                    else:
-                        dz_method = str(self._road_params.dz_method or "fit")
-                    if thr is not None:
-                        thr_f = float(thr)
-                        thr_f = max(1.0, min(60.0, thr_f))
-                        self._road_params = RoadAreaParams(
-                            color_dist_thresh=thr_f,
-                            use_perspective=bool(up) if up is not None else bool(self._road_params.use_perspective),
-                            dz_near_bottom_frac=float(nb) if nb is not None else float(self._road_params.dz_near_bottom_frac),
-                            dz_edge_quantile=float(dq) if dq is not None else float(self._road_params.dz_edge_quantile),
-                            dz_method=dz_method,
-                        )
-                    elif up is not None:
-                        self._road_params = RoadAreaParams(
-                            color_dist_thresh=float(self._road_params.color_dist_thresh),
-                            use_perspective=bool(up),
-                            dz_near_bottom_frac=float(nb) if nb is not None else float(self._road_params.dz_near_bottom_frac),
-                            dz_edge_quantile=float(dq) if dq is not None else float(self._road_params.dz_edge_quantile),
-                            dz_method=dz_method,
-                        )
-                    elif nb is not None or dq is not None or dm is not None:
-                        self._road_params = RoadAreaParams(
-                            color_dist_thresh=float(self._road_params.color_dist_thresh),
-                            use_perspective=bool(self._road_params.use_perspective),
-                            dz_near_bottom_frac=float(nb) if nb is not None else float(self._road_params.dz_near_bottom_frac),
-                            dz_edge_quantile=float(dq) if dq is not None else float(self._road_params.dz_edge_quantile),
-                            dz_method=dz_method,
-                        )
+                            return float(lo)
+                        return max(float(lo), min(float(hi), fv))
+
+                    def _parse_dz_method(v: object | None) -> str:
+                        # Backward compatibility: historically encoded as float (0/1/2).
+                        if v is None:
+                            return str(self._road_params.dz_method or "fit")
+                        if isinstance(v, (int, float)):
+                            fv = float(v)
+                            if fv >= 1.5:
+                                return "hough"
+                            if fv >= 0.5:
+                                return "max_width"
+                            return "fit"
+                        s = str(v).strip().lower()
+                        if s in ("max_width", "maxwidth", "max-width", "max"):
+                            return "max_width"
+                        if s in ("hough", "lines", "mask_hough", "mask-lines"):
+                            return "hough"
+                        return "fit"
+
+                    if "color_dist_thresh" in d:
+                        updates["color_dist_thresh"] = _clamped_float(d["color_dist_thresh"], lo=1.0, hi=60.0)
+                    if "use_perspective" in d:
+                        updates["use_perspective"] = _to_bool(d["use_perspective"])
+                    if "dz_near_bottom_frac" in d:
+                        updates["dz_near_bottom_frac"] = _clamped_float(d["dz_near_bottom_frac"], lo=0.05, hi=0.95)
+                    if "dz_edge_quantile" in d:
+                        updates["dz_edge_quantile"] = _clamped_float(d["dz_edge_quantile"], lo=0.0, hi=0.20)
+                    if "dz_method" in d:
+                        updates["dz_method"] = _parse_dz_method(d.get("dz_method"))
+
+                    if updates:
+                        self._road_params = replace(self._road_params, **updates)
                 except Exception:
                     pass
 
@@ -374,15 +386,14 @@ class VideoProcessor:
         ).clamp()
         self._danger_zone_manual_override = False
         self._danger_zone_mode = (det_cfg.danger_zone_mode or "roi").strip().lower()
-        if self._danger_zone_mode not in ("roi", "road"):
-            self._danger_zone_mode = "roi"
+        if self._danger_zone_mode not in (self._DZ_MODE_ROI, self._DZ_MODE_ROAD):
+            self._danger_zone_mode = self._DZ_MODE_ROI
         self._show_road_mask = bool(det_cfg.show_road_mask)
         self._road_params = RoadAreaParams()
 
         # road-based danger zone smoothing (best-effort)
         road_dz_smoothed: DangerZonePct | None = None
-        road_alpha = 0.25
-        road_params = self._road_params
+        road_alpha = self._ROAD_DZ_ALPHA
 
         try:
             while not self._stop_event.is_set():
@@ -403,7 +414,7 @@ class VideoProcessor:
 
                 # 1) choose danger zone source
                 mode = (self._danger_zone_mode or "roi").strip().lower()
-                if mode == "road" and not self._danger_zone_manual_override:
+                if mode == self._DZ_MODE_ROAD and not self._danger_zone_manual_override:
                     # detect drivable area mask and derive danger zone from it
                     road_params = self._road_params
                     rm = estimate_road_mask(frame, road_params)
@@ -470,7 +481,7 @@ class VideoProcessor:
                 self._emit(FrameResult(frame_info=info, frame_bgr=frame, persons=persons, obstructing=obstructing))
 
                 now = time.time()
-                if now - last_progress_emit > 0.2:
+                if now - last_progress_emit > self._PROGRESS_EMIT_PERIOD_S:
                     last_progress_emit = now
                     self._emit(
                         ProcessorProgress(
