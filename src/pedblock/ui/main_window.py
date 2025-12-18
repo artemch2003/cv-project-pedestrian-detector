@@ -32,6 +32,12 @@ class MainWindow(ctk.CTk):
         self._processor = VideoProcessor()
         self._preview_imgtk_main: ImageTk.PhotoImage | None = None
         self._preview_imgtk_mask: ImageTk.PhotoImage | None = None
+        # Keep last rendered images (BGR) so we can re-fit on window resize without recomputing detection/masks.
+        self._last_preview_bgr_main: np.ndarray | None = None
+        self._last_preview_bgr_mask: np.ndarray | None = None
+        self._preview_rescale_after_id: str | None = None
+        self._preview_mask_visible: bool = False
+        self._preview_right: ctk.CTkFrame | None = None
         self._paused = False
         self._roi_internal_update = False
         self._last_frame: FrameResult | None = None
@@ -141,6 +147,13 @@ class MainWindow(ctk.CTk):
 
     def _set_preview_bgr(self, bgr, *, target: str = "main") -> None:
         lbl = self.preview_main if target == "main" else self.preview_mask
+        try:
+            if target == "main":
+                self._last_preview_bgr_main = bgr
+            else:
+                self._last_preview_bgr_mask = bgr
+        except Exception:
+            pass
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
 
@@ -156,11 +169,49 @@ class MainWindow(ctk.CTk):
             self._preview_imgtk_mask = imgtk
         lbl.configure(image=imgtk, text="")
 
+    def _schedule_preview_rescale(self) -> None:
+        # Debounce frequent <Configure> events.
+        if self._preview_rescale_after_id is not None:
+            try:
+                self.after_cancel(self._preview_rescale_after_id)
+            except Exception:
+                pass
+            self._preview_rescale_after_id = None
+        self._preview_rescale_after_id = self.after(60, self._rescale_preview_from_cache)
+
+    def _rescale_preview_from_cache(self) -> None:
+        self._preview_rescale_after_id = None
+        if self._last_preview_bgr_main is not None and getattr(self._last_preview_bgr_main, "size", 0) != 0:
+            self._set_preview_bgr(self._last_preview_bgr_main, target="main")
+        if (
+            self._preview_mask_visible
+            and self._last_preview_bgr_mask is not None
+            and getattr(self._last_preview_bgr_mask, "size", 0) != 0
+        ):
+            self._set_preview_bgr(self._last_preview_bgr_mask, target="mask")
+
     def _set_mask_panel_visible(self, visible: bool) -> None:
-        if visible:
-            self.preview_mask.grid()
-        else:
-            self.preview_mask.grid_remove()
+        self._preview_mask_visible = bool(visible)
+        # When mask panel is hidden, let the main preview span the full width.
+        try:
+            if self._preview_right is not None:
+                if visible:
+                    self._preview_right.grid_columnconfigure(0, weight=3)
+                    self._preview_right.grid_columnconfigure(1, weight=1, minsize=280)
+                    self.preview_main.grid_configure(column=0, columnspan=1, padx=(12, 6))
+                    self.preview_mask.grid()
+                else:
+                    self._preview_right.grid_columnconfigure(0, weight=1)
+                    self._preview_right.grid_columnconfigure(1, weight=0, minsize=0)
+                    self.preview_mask.grid_remove()
+                    self.preview_main.grid_configure(column=0, columnspan=2, padx=12)
+        except Exception:
+            # Best-effort layout; never break preview rendering
+            if visible:
+                self.preview_mask.grid()
+            else:
+                self.preview_mask.grid_remove()
+        self._schedule_preview_rescale()
 
     def _get_road_params(self) -> RoadAreaParams:
         thr = float(self._road_color_thresh_var.get())
@@ -908,14 +959,25 @@ class MainWindow(ctk.CTk):
         right.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
         right.grid_rowconfigure(0, weight=1)
         right.grid_columnconfigure(0, weight=1)
-        right.grid_columnconfigure(1, weight=1)
+        right.grid_columnconfigure(1, weight=0, minsize=0)
+        self._preview_right = right
 
-        self.preview_main = ctk.CTkLabel(right, text="Откройте видео и нажмите Старт", anchor="center")
-        self.preview_main.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
+        self.preview_main = ctk.CTkLabel(
+            right,
+            text="Откройте видео и нажмите Старт",
+            anchor="center",
+        )
+        self.preview_main.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=12, pady=12)
 
         self.preview_mask = ctk.CTkLabel(right, text="Маска (включите «Показывать маску…»)", anchor="center")
         self.preview_mask.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
         self.preview_mask.grid_remove()
+        self._preview_mask_visible = False
+
+        # Re-fit previews when user resizes the window.
+        self.preview_main.bind("<Configure>", lambda _e: self._schedule_preview_rescale())
+        self.preview_mask.bind("<Configure>", lambda _e: self._schedule_preview_rescale())
+        right.bind("<Configure>", lambda _e: self._schedule_preview_rescale())
 
         # Bind updates for labels
         self.conf_var.trace_add("write", lambda *_: self.conf_lbl.configure(text=f"{self.conf_var.get():.2f}"))
