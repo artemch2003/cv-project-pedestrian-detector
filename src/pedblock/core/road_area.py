@@ -96,6 +96,9 @@ class RoadAreaParams:
     # Способ построения danger_zone из маски:
     # - "fit": как раньше — фитим левую/правую границу как x = a*y + b по нескольким срезам
     # - "max_width": нижнее основание берём по строке с максимальной шириной маски (в near-band)
+    # - "hough": боковые стороны (как “красные линии”) из Canny+Hough по краям маски,
+    #            при этом y_top/y_bottom фиксированы (по выбранной near-band), а верхнее основание
+    #            фиксируется по ширине маски на y_top
     dz_method: str = "fit"
 
 
@@ -613,6 +616,97 @@ def danger_zone_pct_from_road_mask(
             cx0 = 0.5 * float(x1_b + x2_b)
             x1_t = cx0 - 0.5 * target_w
             x2_t = cx0 + 0.5 * target_w
+    elif method in ("hough", "lines", "mask_hough", "mask-lines"):
+        # Side-lines mode: find left/right boundary lines from the *mask edges* (Canny + HoughLinesP),
+        # then evaluate them at fixed y_top=y1 and y_bot=y2.
+        y_top = float(y1)
+        y_bot = float(y2)
+
+        # Fix the top base by reading mask boundaries at y_top (robust quantiles).
+        lr0 = lr_at(int(y1), q=q)
+        if lr0 is not None:
+            x1_t, x2_t = float(lr0[0]), float(lr0[1])
+        else:
+            # If top row is too sparse/noisy, fallback to a conservative centered top.
+            lr_mid = lr_at(int(round((y1 + y2) / 2.0)), q=q)
+            if lr_mid is None:
+                return None
+            mid_l, mid_r = float(lr_mid[0]), float(lr_mid[1])
+            mid_w = max(10.0, float(mid_r - mid_l))
+            cx0 = 0.5 * (mid_l + mid_r)
+            x1_t = cx0 - 0.5 * (mid_w * 0.70)
+            x2_t = cx0 + 0.5 * (mid_w * 0.70)
+
+        # Mask edges within near-band
+        edges = cv2.Canny((m_u8 > 0).astype(np.uint8) * 255, 60, 180)
+        if 0 < int(y1) < h:
+            edges[: int(y1), :] = 0
+        if 0 <= int(y2) < h - 1:
+            edges[int(y2) + 1 :, :] = 0
+
+        min_line_len = max(20, int(round(float(w) * float(max(0.03, min(0.25, p.min_line_len_frac))))))
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180.0,
+            threshold=int(max(20, int(p.hough_threshold * 0.6))),
+            minLineLength=int(min_line_len),
+            maxLineGap=int(max(5, int(p.max_line_gap))),
+        )
+        if lines is None or len(lines) == 0:
+            return None
+
+        # Represent boundary as x = a*y + b (more stable than y=mx+b for near-vertical edges).
+        left: list[tuple[float, float, float]] = []   # (a, b, wt)
+        right: list[tuple[float, float, float]] = []  # (a, b, wt)
+        min_abs_a = 0.10  # minimal |dx/dy| to avoid near-horizontal segments
+        yb = float(y_bot)
+        cx = float(w) * 0.5
+        for (x1s, y1s, x2s, y2s) in lines.reshape(-1, 4):
+            dx = float(x2s - x1s)
+            dy = float(y2s - y1s)
+            if abs(dy) < 1e-6:
+                continue
+            a = dx / dy
+            if abs(a) < min_abs_a:
+                continue
+            b = float(x1s) - a * float(y1s)
+            wt = float(np.hypot(dx, dy))
+            if wt <= 1e-3:
+                continue
+
+            xb = a * yb + b
+            if xb < cx:
+                left.append((a, b, wt))
+            else:
+                right.append((a, b, wt))
+
+        def wavg(items: list[tuple[float, float, float]]) -> tuple[float, float] | None:
+            if not items:
+                return None
+            sw = sum(wt for _, _, wt in items)
+            if sw <= 1e-6:
+                return None
+            a_ = sum(av * wt for av, _, wt in items) / sw
+            b_ = sum(bv * wt for _, bv, wt in items) / sw
+            return float(a_), float(b_)
+
+        abL = wavg(left)
+        abR = wavg(right)
+        if abL is None or abR is None:
+            return None
+
+        aL, bL = abL
+        aR, bR = abR
+
+        # Anchor side lines so that they pass through the *fixed top base* points.
+        bL = float(x1_t) - float(aL) * float(y_top)
+        bR = float(x2_t) - float(aR) * float(y_top)
+
+        x1_b = float(aL) * float(y_bot) + float(bL)
+        x2_b = float(aR) * float(y_bot) + float(bR)
+        if x2_t <= x1_t or x2_b <= x1_b:
+            return None
     else:
         frs = getattr(p, "dz_sample_fracs", (0.10, 0.35, 0.65, 0.95))
         frs = tuple(float(max(0.0, min(1.0, f))) for f in frs)
@@ -642,8 +736,9 @@ def danger_zone_pct_from_road_mask(
         aL, bL = fit_line_yx(pts_l)
         aR, bR = fit_line_yx(pts_r)
 
-        y_top = float(min(ys_samp))
-        y_bot = float(max(ys_samp))
+        # Keep height fixed to the selected near-band.
+        y_top = float(y1)
+        y_bot = float(y2)
         x1_t = aL * y_top + bL
         x2_t = aR * y_top + bR
         x1_b = aL * y_bot + bL

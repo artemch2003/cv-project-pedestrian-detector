@@ -136,7 +136,12 @@ class VideoProcessor:
             payload["dz_edge_quantile"] = float(dz_edge_quantile)
         if dz_method is not None:
             m = str(dz_method or "fit").strip().lower()
-            payload["dz_method"] = 1.0 if m in ("max_width", "maxwidth", "max-width", "max") else 0.0
+            if m in ("max_width", "maxwidth", "max-width", "max"):
+                payload["dz_method"] = 1.0
+            elif m in ("hough", "lines", "mask_hough", "mask-lines"):
+                payload["dz_method"] = 2.0
+            else:
+                payload["dz_method"] = 0.0
         self._enqueue_ctrl(_ControlCmd(kind="road_params", value=payload))
 
     def set_danger_zone_pct(self, dz: DangerZonePct) -> None:
@@ -266,7 +271,19 @@ class VideoProcessor:
                     nb = d.get("dz_near_bottom_frac", None)
                     dq = d.get("dz_edge_quantile", None)
                     dm = d.get("dz_method", None)
-                    dz_method = "max_width" if (dm is not None and float(dm) >= 0.5) else str(self._road_params.dz_method or "fit")
+                    if dm is not None:
+                        try:
+                            dm_f = float(dm)
+                        except Exception:
+                            dm_f = 0.0
+                        if dm_f >= 1.5:
+                            dz_method = "hough"
+                        elif dm_f >= 0.5:
+                            dz_method = "max_width"
+                        else:
+                            dz_method = "fit"
+                    else:
+                        dz_method = str(self._road_params.dz_method or "fit")
                     if thr is not None:
                         thr_f = float(thr)
                         thr_f = max(1.0, min(60.0, thr_f))
