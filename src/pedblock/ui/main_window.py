@@ -30,8 +30,9 @@ class MainWindow(ctk.CTk):
 
         self._video_path: str | None = None
         self._processor = VideoProcessor()
-        self._preview_imgtk_main: ImageTk.PhotoImage | None = None
-        self._preview_imgtk_mask: ImageTk.PhotoImage | None = None
+        # For CTkLabel previews use CTkImage (not PIL.ImageTk.PhotoImage), иначе будет warning и проблемы с HiDPI scaling.
+        self._preview_ctkimg_main: ctk.CTkImage | None = None
+        self._preview_ctkimg_mask: ctk.CTkImage | None = None
         # Keep last rendered images (BGR) so we can re-fit on window resize without recomputing detection/masks.
         self._last_preview_bgr_main: np.ndarray | None = None
         self._last_preview_bgr_mask: np.ndarray | None = None
@@ -162,12 +163,13 @@ class MainWindow(ctk.CTk):
         h = max(10, lbl.winfo_height())
         img.thumbnail((w, h))
 
-        imgtk = ImageTk.PhotoImage(img)
+        # customtkinter expects CTkImage for proper HiDPI scaling
+        ctkimg = ctk.CTkImage(light_image=img, dark_image=img, size=(img.width, img.height))
         if target == "main":
-            self._preview_imgtk_main = imgtk
+            self._preview_ctkimg_main = ctkimg
         else:
-            self._preview_imgtk_mask = imgtk
-        lbl.configure(image=imgtk, text="")
+            self._preview_ctkimg_mask = ctkimg
+        lbl.configure(image=ctkimg, text="")
 
     def _schedule_preview_rescale(self) -> None:
         # Debounce frequent <Configure> events.
