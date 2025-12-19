@@ -9,7 +9,7 @@ import numpy as np
 
 from pedblock.core.annotate import draw_annotations
 from pedblock.core.config import DetectionConfig, ExportConfig, RoiPct
-from pedblock.core.danger_zone import DangerZonePct, danger_zone_pct_to_px
+from pedblock.core.danger_zone import DangerZonePct, danger_zone_pct_from_rect, danger_zone_pct_to_px
 from pedblock.core.events import EventRecorder, ObstructionSpan, spans_to_jsonable
 from pedblock.core.roi import roi_pct_to_px
 from pedblock.core.road_area import RoadAreaParams, danger_zone_pct_from_road_mask, estimate_road_mask
@@ -74,16 +74,7 @@ def run(vp: RunTarget, video_path: str, det_cfg: DetectionConfig, exp_cfg: Expor
         w=float(det_cfg.roi.w),
         h=float(det_cfg.roi.h),
     ).clamp()
-    vp._danger_zone_pct = DangerZonePct.from_quad(
-        vp._roi_pct.x,
-        vp._roi_pct.y,
-        vp._roi_pct.x + vp._roi_pct.w,
-        vp._roi_pct.y,
-        vp._roi_pct.x + vp._roi_pct.w,
-        vp._roi_pct.y + vp._roi_pct.h,
-        vp._roi_pct.x,
-        vp._roi_pct.y + vp._roi_pct.h,
-    ).clamp()
+    vp._danger_zone_pct = danger_zone_pct_from_rect(vp._roi_pct.x, vp._roi_pct.y, vp._roi_pct.w, vp._roi_pct.h)
     vp._danger_zone_manual_override = False
     vp._danger_zone_mode = (det_cfg.danger_zone_mode or "roi").strip().lower()
     if vp._danger_zone_mode not in (vp._DZ_MODE_ROI, vp._DZ_MODE_ROAD):
@@ -137,17 +128,7 @@ def run(vp: RunTarget, video_path: str, det_cfg: DetectionConfig, exp_cfg: Expor
             if dz_pct is None:
                 dz_pct = vp._danger_zone_pct
             if dz_pct is None:
-                _ = roi_pct_to_px(vp._roi_pct.x, vp._roi_pct.y, vp._roi_pct.w, vp._roi_pct.h, w, h)
-                dz_pct = DangerZonePct.from_quad(
-                    vp._roi_pct.x,
-                    vp._roi_pct.y,
-                    vp._roi_pct.x + vp._roi_pct.w,
-                    vp._roi_pct.y,
-                    vp._roi_pct.x + vp._roi_pct.w,
-                    vp._roi_pct.y + vp._roi_pct.h,
-                    vp._roi_pct.x,
-                    vp._roi_pct.y + vp._roi_pct.h,
-                ).clamp()
+                dz_pct = danger_zone_pct_from_rect(vp._roi_pct.x, vp._roi_pct.y, vp._roi_pct.w, vp._roi_pct.h)
 
             last_used_dz_pct = dz_pct
             dz = danger_zone_pct_to_px(dz_pct, w, h)

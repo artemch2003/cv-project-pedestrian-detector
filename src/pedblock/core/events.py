@@ -24,6 +24,12 @@ class EventRecorder:
     fps: float
     _open_start_frame: int | None = None
 
+    def _frame_to_time_s(self, frame_index: int) -> float:
+        fps = float(self.fps)
+        if fps <= 0:
+            return 0.0
+        return float(frame_index) / fps
+
     def update(self, frame_index: int, obstructing: bool) -> list[ObstructionSpan]:
         emitted: list[ObstructionSpan] = []
         if obstructing and self._open_start_frame is None:
@@ -37,8 +43,8 @@ class EventRecorder:
                 ObstructionSpan(
                     start_frame=s,
                     end_frame=e,
-                    start_time_s=(s / self.fps) if self.fps > 0 else 0.0,
-                    end_time_s=(e / self.fps) if self.fps > 0 else 0.0,
+                    start_time_s=self._frame_to_time_s(s),
+                    end_time_s=self._frame_to_time_s(e),
                 )
             )
             self._open_start_frame = None
@@ -54,8 +60,8 @@ class EventRecorder:
             ObstructionSpan(
                 start_frame=s,
                 end_frame=e,
-                start_time_s=(s / self.fps) if self.fps > 0 else 0.0,
-                end_time_s=(e / self.fps) if self.fps > 0 else 0.0,
+                start_time_s=self._frame_to_time_s(s),
+                end_time_s=self._frame_to_time_s(e),
             )
         ]
 

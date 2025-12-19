@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
 
 __all__ = [
     "PointPct",
     "PointPx",
     "DangerZonePct",
     "DangerZonePx",
+    "danger_zone_pct_from_rect",
     "danger_zone_pct_to_px",
 ]
 
 
 PointPct = tuple[float, float]
 PointPx = tuple[int, int]
+
+_EPS = 1e-9
 
 
 def _clamp_pct(v: float) -> float:
@@ -30,7 +32,7 @@ def _ray_cast_contains_point(poly: list[tuple[float, float]], x: float, y: float
     for i in range(n):
         xi, yi = poly[i]
         xj, yj = poly[j]
-        denom = (yj - yi) if (yj - yi) != 0 else 1e-9
+        denom = (yj - yi) if (yj - yi) != 0 else _EPS
         intersect = ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / denom + xi)
         if intersect:
             inside = not inside
@@ -96,5 +98,13 @@ def danger_zone_pct_to_px(dz: DangerZonePct, w: int, h: int) -> DangerZonePx:
 
     pts = tuple((px_x(x), px_y(y)) for (x, y) in dz.points)
     return DangerZonePx(points=pts).clamp(w, h)
+
+
+def danger_zone_pct_from_rect(x: float, y: float, w: float, h: float) -> DangerZonePct:
+    """
+    Convenience helper to build a rectangular danger zone from ROI-like params (pct units).
+    Keeps logic in one place to avoid repeating from_quad(...).clamp() across the codebase.
+    """
+    return DangerZonePct.from_quad(x, y, x + w, y, x + w, y + h, x, y + h).clamp()
 
 

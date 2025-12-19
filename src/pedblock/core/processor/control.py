@@ -4,7 +4,7 @@ from dataclasses import replace
 import queue
 
 from pedblock.core.config import RoiPct
-from pedblock.core.danger_zone import DangerZonePct
+from pedblock.core.danger_zone import DangerZonePct, danger_zone_pct_from_rect
 from pedblock.core.road_area import RoadAreaParams
 
 from .models import _ControlCmd
@@ -76,16 +76,7 @@ def drain_ctrl(vp: ControlTarget) -> None:
                 x, y, w, h = cmd.value  # type: ignore[misc]
                 vp._roi_pct = RoiPct(x=float(x), y=float(y), w=float(w), h=float(h)).clamp()
                 # If user sets a rectangle ROI manually, treat it as a quad (rectangle).
-                vp._danger_zone_pct = DangerZonePct.from_quad(
-                    vp._roi_pct.x,
-                    vp._roi_pct.y,
-                    vp._roi_pct.x + vp._roi_pct.w,
-                    vp._roi_pct.y,
-                    vp._roi_pct.x + vp._roi_pct.w,
-                    vp._roi_pct.y + vp._roi_pct.h,
-                    vp._roi_pct.x,
-                    vp._roi_pct.y + vp._roi_pct.h,
-                ).clamp()
+                vp._danger_zone_pct = danger_zone_pct_from_rect(vp._roi_pct.x, vp._roi_pct.y, vp._roi_pct.w, vp._roi_pct.h)
                 vp._danger_zone_manual_override = False
             except Exception:
                 pass
@@ -107,16 +98,7 @@ def drain_ctrl(vp: ControlTarget) -> None:
                 vp._danger_zone_mode = m
                 vp._danger_zone_manual_override = False
                 if m == vp._DZ_MODE_ROI:
-                    vp._danger_zone_pct = DangerZonePct.from_quad(
-                        vp._roi_pct.x,
-                        vp._roi_pct.y,
-                        vp._roi_pct.x + vp._roi_pct.w,
-                        vp._roi_pct.y,
-                        vp._roi_pct.x + vp._roi_pct.w,
-                        vp._roi_pct.y + vp._roi_pct.h,
-                        vp._roi_pct.x,
-                        vp._roi_pct.y + vp._roi_pct.h,
-                    ).clamp()
+                    vp._danger_zone_pct = danger_zone_pct_from_rect(vp._roi_pct.x, vp._roi_pct.y, vp._roi_pct.w, vp._roi_pct.h)
             except Exception:
                 pass
         elif cmd.kind == "show_road_mask":

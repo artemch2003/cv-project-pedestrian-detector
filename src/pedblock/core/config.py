@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+from typing import Literal, TypeAlias
 
 __all__ = [
     "RoiPct",
+    "DangerZoneMode",
     "DetectionConfig",
     "ExportConfig",
 ]
+
+DangerZoneMode: TypeAlias = Literal["roi", "road"]
 
 
 @dataclass(slots=True)
@@ -42,7 +46,7 @@ class DetectionConfig:
     # danger_zone source:
     # - "roi": manual rectangle (converted to quad)
     # - "road": build danger_zone from detected road (drivable area) mask
-    danger_zone_mode: str = "roi"
+    danger_zone_mode: DangerZoneMode = "roi"
     # overlay drivable-area mask on preview/export frames (if available)
     show_road_mask: bool = False
 
